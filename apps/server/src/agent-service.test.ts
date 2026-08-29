@@ -2,10 +2,12 @@ import { mkdtemp } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
-import { AgentService } from "./agent-service.js";
+import { AgentService, defaultPrincipal } from "./agent-service.js";
 import { loadConfig } from "./config.js";
+import { HttpError } from "./errors.js";
+import { MockResourceService } from "./mock-resource-service.js";
 import { JsonStore } from "./store.js";
-import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
+import type { AgentRunner, Principal, RunnerRequest, RunnerResult } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 class FakeRunner implements AgentRunner {
@@ -46,15 +48,27 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
     ARK_API_KEY: "test-key",
     ARK_MODEL: "ep-test",
   });
+  const store = new JsonStore(path.join(root, "data", "db.json"));
+  const mockResourceService = new MockResourceService(config, store);
   const service = new AgentService(
     config,
-    new JsonStore(path.join(root, "data", "db.json")),
+    store,
     new WorkspaceManager(path.join(root, "workspaces")),
     runner,
+    mockResourceService,
   );
   await service.initialize();
   return service;
 }
+
+const principal = (userId: string): Principal => ({
+  kind: "human",
+  id: "user:" + userId,
+  userId,
+  runId: undefined,
+  scopes: [],
+  expiresAt: undefined,
+});
 
 describe("Agent lifecycle", () => {
   it("creates, updates, stops, starts and deletes an Agent", async () => {
@@ -128,6 +142,71 @@ describe("Agent lifecycle", () => {
     });
 
     finish({ output: "done", threadId: "thread", usage: null });
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+  });
+});
+
+describe("Bouncer ownership boundary (boundary 2)", () => {
+  it("attributes an Agent to its creating principal and lists only owned Agents", async () => {
+    const service = await makeService();
+    const alice = principal("alice");
+    const bob = principal("bob");
+
+    const aliceAgent = await service.createAgent({ name: "Alice's Coder" }, alice);
+    expect(aliceAgent.ownerId).toBe("alice");
+
+    const bobAgent = await service.createAgent({ name: "Bob's Coder" }, bob);
+    expect(bobAgent.ownerId).toBe("bob");
+
+    expect(service.listAgents(alice).map((a) => a.id)).toEqual([aliceAgent.id]);
+    expect(service.listAgents(bob).map((a) => a.id)).toEqual([bobAgent.id]);
+    expect(service.listAgents().map((a) => a.id)).toEqual([]);
+  });
+
+  it("denies a non-owner read/send/delete with 403 and audits the denial", async () => {
+    const service = await makeService();
+    const alice = principal("alice");
+    const bob = principal("bob");
+
+    const agent = await service.createAgent({ name: "Alice's Coder" }, alice);
+
+    expect(() => service.getAgent(agent.id, bob)).toThrow(HttpError);
+    expect(() => service.getAgent(agent.id, bob)).toThrow("Not authorized to access this Agent");
+    expect(() => service.getMessages(agent.id, bob)).toThrow(HttpError);
+    expect(() => service.getRuns(agent.id, bob)).toThrow(HttpError);
+    expect(() => service.getAgent(agent.id, principal("default"))).toThrow(HttpError);
+    await expect(service.sendMessage(agent.id, "hi", bob)).rejects.toMatchObject({
+      statusCode: 403,
+    });
+    await expect(service.deleteAgent(agent.id, bob)).rejects.toMatchObject({
+      statusCode: 403,
+    });
+    await expect(service.revokeCredential(agent.id, bob)).rejects.toMatchObject({
+      statusCode: 403,
+    });
+
+    // Deny audits are fire-and-forget from the sync read path; poll for them.
+    await expect
+      .poll(() =>
+        service
+          .listAudit(agent.id, alice)
+          .filter((row) => row.decision === "deny" && row.reason === "not owner").length,
+      )
+      .toBeGreaterThan(0);
+
+    // The protected asset (the Agent) is unchanged: still owned by Alice and intact.
+    const intact = service.getAgent(agent.id, alice);
+    expect(intact.id).toBe(agent.id);
+    expect(intact.ownerId).toBe("alice");
+  });
+
+  it("uses the synthetic default principal when no X-Mock-User is present", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "Default" });
+    expect(agent.ownerId).toBe("default");
+    expect(service.getAgent(agent.id, defaultPrincipal()).id).toBe(agent.id);
+
+    const { run } = await service.sendMessage(agent.id, "hello");
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
   });
 });
