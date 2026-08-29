@@ -38,6 +38,11 @@ const envSchema = z.object({
     .max(128)
     .regex(/^[A-Za-z0-9._~-]*$/, "APP_AUTH_TOKEN must use URL-safe characters")
     .optional(),
+  MOCK_RESOURCE_HOST: z.string().default("0.0.0.0"),
+  MOCK_RESOURCE_PORT: z.coerce.number().int().min(1).max(65535).default(3001),
+  // Tier 2 secret for the mock resource upstream. Required once the upstream
+  // gate is implemented (Day 2). Never logged or returned in any response.
+  REAL_UPSTREAM_SECRET: z.string().trim().min(24).optional(),
   ARK_API_KEY: z.string().optional(),
   ARK_MODEL: z.string().optional(),
   ARK_BASE_URL: z
@@ -52,6 +57,7 @@ export type AppConfig = ReturnType<typeof loadConfig>;
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
   const env = envSchema.parse(environment);
   const authToken = env.APP_AUTH_TOKEN?.trim() ?? "";
+  const realUpstreamSecret = env.REAL_UPSTREAM_SECRET ?? "";
   const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
   if (env.NODE_ENV === "production" && !loopbackHosts.has(env.HOST)) {
     if (authToken.length < 24 || authToken.startsWith("replace-")) {
@@ -84,6 +90,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     containerUser: env.CONTAINER_USER?.trim() || defaultContainerUser,
     runtimeInstanceId: env.RUNTIME_INSTANCE_ID,
     authToken,
+    mockResourceHost: env.MOCK_RESOURCE_HOST,
+    mockResourcePort: env.MOCK_RESOURCE_PORT,
+    realUpstreamSecret,
     arkApiKey: env.ARK_API_KEY?.trim() ?? "",
     arkModel: env.ARK_MODEL?.trim() ?? "",
     arkBaseUrl: env.ARK_BASE_URL.replace(/\/+$/, ""),
@@ -116,7 +125,7 @@ export async function writeCodexConfig(config: AppConfig): Promise<void> {
     "",
   ].join("\n");
   await writeFile(path.join(config.codexHome, "config.toml"), toml, {
-    encoding: "utf8",
+    encoding: "utf-8",
     mode: 0o600,
   });
 }
