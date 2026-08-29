@@ -132,7 +132,7 @@ export class CodexRunner implements AgentRunner {
     const args = buildCodexArgs(request, this.config.codexSandboxMode);
     const child = spawn(this.config.codexBin, args, {
       cwd: request.workspacePath,
-      env: this.childEnvironment(),
+      env: this.childEnvironment(request.proxyPort),
       stdio: ["ignore", "pipe", "pipe"],
     });
     const settled = new Promise<void>((resolve) => {
@@ -239,7 +239,7 @@ export class CodexRunner implements AgentRunner {
     }
   }
 
-  private childEnvironment(): NodeJS.ProcessEnv {
+  private childEnvironment(proxyPort?: number): NodeJS.ProcessEnv {
     const inheritedNames = [
       "PATH",
       "HOME",
@@ -254,6 +254,7 @@ export class CodexRunner implements AgentRunner {
       "NODE_EXTRA_CA_CERTS",
       "TERM",
     ] as const;
+    const arkHost = new URL(this.config.arkBaseUrl).host;
     const environment: NodeJS.ProcessEnv = {
       CODEX_HOME: this.config.codexHome,
       ARK_API_KEY: this.config.arkApiKey,
@@ -261,6 +262,11 @@ export class CodexRunner implements AgentRunner {
     };
     for (const name of inheritedNames) {
       if (process.env[name] !== undefined) environment[name] = process.env[name];
+    }
+    if (proxyPort !== undefined) {
+      environment.HTTP_PROXY = `http://host.docker.internal:${proxyPort}`;
+      environment.HTTPS_PROXY = `http://host.docker.internal:${proxyPort}`;
+      environment.NO_PROXY = arkHost;
     }
     return environment;
   }

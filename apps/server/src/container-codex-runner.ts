@@ -41,6 +41,18 @@ export function buildContainerRunArgs(
 ): string[] {
   const name = containerName(request.agentId, config.runtimeInstanceId);
   const engineName = config.containerEngine.split(/[\\/]/).at(-1)?.toLowerCase();
+  const arkHost = new URL(config.arkBaseUrl).host;
+  const proxyEnv =
+    typeof request.proxyPort === "number"
+      ? [
+          "--env",
+          `HTTP_PROXY=http://host.docker.internal:${request.proxyPort}`,
+          "--env",
+          `HTTPS_PROXY=http://host.docker.internal:${request.proxyPort}`,
+          "--env",
+          `NO_PROXY=${arkHost}`,
+        ]
+      : [];
   return [
     "run",
     "--rm",
@@ -56,6 +68,10 @@ export function buildContainerRunArgs(
     ...(engineName === "podman" ? ["--userns", "keep-id"] : []),
     "--network",
     "bridge",
+    "--add-host",
+    "host.docker.internal:host-gateway",
+    "--add-host",
+    "host.containers.internal:host-gateway",
     "--security-opt",
     "no-new-privileges",
     "--cap-drop",
@@ -76,6 +92,7 @@ export function buildContainerRunArgs(
     "HOME=/tmp",
     "--env",
     "NO_COLOR=1",
+    ...proxyEnv,
     "--mount",
     "type=bind,src=" + request.workspacePath + ",dst=/workspace",
     "--mount",
@@ -197,6 +214,12 @@ export class ContainerCodexRunner implements AgentRunner {
     child.stdout.on("data", (chunk: Buffer) => consume(chunk, "stdout"));
     child.stderr.on("data", (chunk: Buffer) => consume(chunk, "stderr"));
 
+    if (request.tightenEgressProxy) {
+      void this.discoverContainerIp(active.containerName).then((ip) => {
+        if (ip) request.tightenEgressProxy?.(ip);
+      });
+    }
+
     const timeout = setTimeout(() => {
       active.timedOut = true;
       void this.removeContainer(active);
@@ -233,6 +256,27 @@ export class ContainerCodexRunner implements AgentRunner {
       clearTimeout(timeout);
       this.active.delete(request.agentId);
     }
+  }
+
+  private async discoverContainerIp(containerName: string): Promise<string | null> {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const { stdout } = await execFileAsync(
+          this.config.containerEngine,
+          ["inspect", containerName, "--format", "{{.NetworkSettings.IPAddress}}"],
+          { timeout: 3_000, env: this.childEnvironment() },
+        );
+        const ip = stdout.trim();
+        if (ip) return ip;
+      } catch {
+        // container or bridge IP not assigned yet; retry shortly
+      }
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 200);
+        timer.unref();
+      });
+    }
+    return null;
   }
 
   private childEnvironment(): NodeJS.ProcessEnv {

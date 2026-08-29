@@ -1,20 +1,43 @@
 import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
+import { startEgressProxy, type EgressProxy } from "./egress-proxy.js";
 import { HttpError, RunCancelledError } from "./errors.js";
+import type { MockResourceService } from "./mock-resource-service.js";
 import { JsonStore } from "./store.js";
 import type {
   Agent,
   AgentRun,
   AgentRunner,
+  Audit,
   CreateAgentInput,
   Message,
+  Principal,
+  RunnerRequest,
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
 
+/** The synthetic principal used when X-Mock-User is absent (baseline operator). */
+export const defaultPrincipal = (): Principal => ({
+  kind: "human",
+  id: "user:default",
+  userId: "default",
+  runId: undefined,
+  scopes: [],
+  expiresAt: undefined,
+});
+
+/**
+ * AgentService coordinates lifecycle, persistence, workspaces, and Runs. Every
+ * operation crosses the ownership boundary (boundary 2): a human principal may
+ * only drive an Agent they own, else 403 + an Audit row. In container mode,
+ * `executeRun` mints a Tier 1 credential and starts a per-run egress proxy so
+ * the disposable container can reach the mock resource service without ever
+ * holding the credential itself.
+ */
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
   private readonly cancellationRequests = new Set<string>();
@@ -24,11 +47,13 @@ export class AgentService {
     private readonly store: JsonStore,
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
+    private readonly mockResourceService: MockResourceService,
   ) {}
 
   async initialize(): Promise<void> {
     await this.store.initialize();
     await this.workspaces.initialize();
+    await this.mockResourceService.initialize();
     await this.store.mutate((database) => {
       for (const run of database.runs) {
         if (run.status === "queued" || run.status === "running") {
@@ -46,29 +71,36 @@ export class AgentService {
     });
   }
 
-  listAgents(): Agent[] {
+  listAgents(principal: Principal = defaultPrincipal()): Agent[] {
     return this.store
       .snapshot()
-      .agents.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+      .agents.filter((agent) => agent.ownerId === principal.userId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
-  getAgent(id: string): Agent {
+  getAgent(id: string, principal: Principal = defaultPrincipal()): Agent {
     const agent = this.store.snapshot().agents.find((item) => item.id === id);
     if (!agent) {
       throw new HttpError(404, "Agent not found");
     }
+    this.assertOwner(agent, principal, "read");
     return agent;
   }
 
-  async createAgent(input: CreateAgentInput): Promise<Agent> {
+  async createAgent(
+    input: CreateAgentInput,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<Agent> {
     const timestamp = now();
     const id = randomUUID();
+    const ownerId = principal.userId ?? "default";
     const agent: Agent = {
       id,
       name: input.name.trim(),
       description: input.description?.trim() ?? "",
       instructions: input.instructions?.trim() ?? "",
       status: "ready",
+      ownerId,
       workspacePath: this.workspaces.workspacePath(id),
       codexThreadId: null,
       lastError: null,
@@ -77,11 +109,16 @@ export class AgentService {
     };
     await this.workspaces.create(agent);
     await this.store.mutate((database) => database.agents.push(agent));
+    await this.audit(principal, agent.id, "create", `agent:${agent.id}`, "allow", "owner");
     return agent;
   }
 
-  async updateAgent(id: string, input: UpdateAgentInput): Promise<Agent> {
-    const current = this.getAgent(id);
+  async updateAgent(
+    id: string,
+    input: UpdateAgentInput,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<Agent> {
+    const current = this.getAgent(id, principal);
     if (current.status === "busy") {
       throw new HttpError(409, "Stop the active run before editing this Agent");
     }
@@ -101,11 +138,15 @@ export class AgentService {
       return structuredClone(agent);
     });
     await this.workspaces.writeInstructions(updated);
+    await this.audit(principal, updated.id, "update", `agent:${updated.id}`, "allow", "owner");
     return updated;
   }
 
-  async deleteAgent(id: string): Promise<{ archivedWorkspace: string }> {
-    const agent = this.getAgent(id);
+  async deleteAgent(
+    id: string,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<{ archivedWorkspace: string }> {
+    const agent = this.getAgent(id, principal);
     await this.cancelExecution(id);
     const archivedWorkspace = await this.workspaces.archive(agent);
     await this.store.mutate((database) => {
@@ -113,37 +154,44 @@ export class AgentService {
       database.messages = database.messages.filter((item) => item.agentId !== id);
       database.runs = database.runs.filter((item) => item.agentId !== id);
     });
+    await this.audit(principal, agent.id, "delete", `agent:${agent.id}`, "allow", "owner");
     return { archivedWorkspace };
   }
 
-  async startAgent(id: string): Promise<Agent> {
-    return this.setStatus(id, "ready");
+  async startAgent(id: string, principal: Principal = defaultPrincipal()): Promise<Agent> {
+    this.getAgent(id, principal);
+    const agent = await this.setStatus(id, "ready");
+    await this.audit(principal, id, "start", `agent:${id}`, "allow", "owner");
+    return agent;
   }
 
-  async stopAgent(id: string): Promise<Agent> {
-    this.getAgent(id);
+  async stopAgent(id: string, principal: Principal = defaultPrincipal()): Promise<Agent> {
+    this.getAgent(id, principal);
     await this.cancelExecution(id);
-    return this.setStatus(id, "stopped");
+    const agent = await this.setStatus(id, "stopped");
+    await this.audit(principal, id, "stop", `agent:${id}`, "allow", "owner");
+    return agent;
   }
 
-  getMessages(agentId: string): Message[] {
-    this.getAgent(agentId);
+  getMessages(agentId: string, principal: Principal = defaultPrincipal()): Message[] {
+    this.getAgent(agentId, principal);
     return this.store
       .snapshot()
       .messages.filter((message) => message.agentId === agentId)
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
-  getRun(runId: string): AgentRun {
+  getRun(runId: string, principal: Principal = defaultPrincipal()): AgentRun {
     const run = this.store.snapshot().runs.find((item) => item.id === runId);
     if (!run) {
       throw new HttpError(404, "Run not found");
     }
+    this.getAgent(run.agentId, principal);
     return run;
   }
 
-  getRuns(agentId: string): AgentRun[] {
-    this.getAgent(agentId);
+  getRuns(agentId: string, principal: Principal = defaultPrincipal()): AgentRun[] {
+    this.getAgent(agentId, principal);
     return this.store
       .snapshot()
       .runs.filter((run) => run.agentId === agentId)
@@ -153,7 +201,9 @@ export class AgentService {
   async sendMessage(
     agentId: string,
     prompt: string,
+    principal: Principal = defaultPrincipal(),
   ): Promise<{ run: AgentRun; message: Message }> {
+    this.getAgent(agentId, principal);
     if (!isArkConfigured(this.config)) {
       throw new HttpError(
         503,
@@ -201,7 +251,8 @@ export class AgentService {
       storedAgent.updatedAt = timestamp;
       return snapshot;
     });
-    const execution = this.executeRun(agentAtStart, run);
+    await this.audit(principal, agentId, "send", `agent:${agentId}`, "allow", "owner", { runId });
+    const execution = this.executeRun(agentAtStart, run, principal);
     this.activeExecutions.set(agentId, execution);
     void execution
       .finally(() => {
@@ -213,6 +264,24 @@ export class AgentService {
     return { run, message };
   }
 
+  async revokeCredential(
+    agentId: string,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<{ revoked: boolean }> {
+    this.getAgent(agentId, principal);
+    const revoked = await this.mockResourceService.revokeCredential(agentId);
+    await this.audit(principal, agentId, "revoke", `credential:${agentId}`, "allow", "owner");
+    return { revoked };
+  }
+
+  listAudit(
+    agentId: string | undefined,
+    principal: Principal = defaultPrincipal(),
+  ): Audit[] {
+    if (agentId) this.getAgent(agentId, principal);
+    return this.mockResourceService.listAudit(agentId);
+  }
+
   async systemInfo(): Promise<Record<string, unknown>> {
     return {
       arkConfigured: isArkConfigured(this.config),
@@ -222,17 +291,20 @@ export class AgentService {
       codexSandboxMode: this.config.codexSandboxMode,
       runtimeProvider: this.config.runtimeProvider,
       containerEngine:
-        this.config.runtimeProvider === "container"
-          ? this.config.containerEngine
-          : null,
+        this.config.runtimeProvider === "container" ? this.config.containerEngine : null,
       runtime:
         this.config.runtimeProvider === "container"
           ? "Codex CLI in " + this.config.containerEngine + " Runtime"
           : "Codex CLI in application container",
+      mockResourcePort: this.config.mockResourcePort,
     };
   }
 
-  private async executeRun(agentAtStart: Agent, run: AgentRun): Promise<void> {
+  private async executeRun(
+    agentAtStart: Agent,
+    run: AgentRun,
+    principal: Principal,
+  ): Promise<void> {
     await this.store.mutate((database) => {
       const storedRun = database.runs.find((item) => item.id === run.id);
       if (storedRun) {
@@ -240,16 +312,50 @@ export class AgentService {
         storedRun.startedAt = now();
       }
     });
+
+    const containerMode = this.config.runtimeProvider === "container";
+    let proxy: EgressProxy | null = null;
+    if (containerMode) {
+      try {
+        const minted = await this.mockResourceService.mintCredential(
+          agentAtStart.id,
+          run.id,
+          agentAtStart.ownerId,
+          [`read:secrets:${agentAtStart.ownerId}`, "act:deploy:dev"],
+        );
+        proxy = await startEgressProxy({
+          token: minted.token,
+          allowHosts: [`host.docker.internal:${this.config.mockResourcePort}`],
+          allowPathPrefixes: ["/mock/proxy/", "/mock/ping"],
+        });
+        // Source-IP tightening (post docker-inspect) is wired in Day 2 alongside
+        // the runner's container-IP discovery; permissive until then.
+      } catch (error) {
+        proxy = null;
+        console.warn(
+          "[bouncer] egress proxy start failed; run proceeding without proxy:",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+
     try {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
-      const result = await this.runner.run({
+      const request: RunnerRequest = {
         agentId: agentAtStart.id,
         workspacePath: agentAtStart.workspacePath,
         prompt: run.prompt,
         threadId: agentAtStart.codexThreadId,
-      });
+      };
+      if (proxy) {
+        request.proxyPort = proxy.port;
+        const proxyHandle = proxy;
+        request.tightenEgressProxy = (sourceIp: string) =>
+          proxyHandle.setExpectedSourceIp(sourceIp);
+      }
+      const result = await this.runner.run(request);
       const completedAt = now();
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
@@ -292,7 +398,45 @@ export class AgentService {
           agent.updatedAt = completedAt;
         }
       });
+    } finally {
+      if (proxy) {
+        await proxy.stop().catch(() => undefined);
+      }
+      if (containerMode) {
+        await this.mockResourceService.revokeCredential(agentAtStart.id).catch(() => undefined);
+      }
     }
+    void principal;
+  }
+
+  private assertOwner(agent: Agent, principal: Principal, action: string): void {
+    if (principal.userId !== agent.ownerId) {
+      void this.audit(principal, agent.id, action, `agent:${agent.id}`, "deny", "not owner");
+      throw new HttpError(403, "Not authorized to access this Agent");
+    }
+  }
+
+  private async audit(
+    principal: Principal,
+    agentId: string | null,
+    action: string,
+    resource: string,
+    decision: "allow" | "deny",
+    reason: string,
+    options: { runId?: string; method?: string; scope?: string; agentPrincipalId?: string } = {},
+  ): Promise<void> {
+    await this.mockResourceService.writeAudit({
+      humanPrincipalId: principal.id,
+      agentId,
+      agentPrincipalId: options.agentPrincipalId ?? null,
+      runId: options.runId ?? null,
+      method: options.method ?? null,
+      action,
+      resource,
+      scope: options.scope ?? null,
+      decision,
+      reason,
+    });
   }
 
   private async setStatus(id: string, status: Agent["status"]): Promise<Agent> {

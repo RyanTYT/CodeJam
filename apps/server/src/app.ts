@@ -1,12 +1,20 @@
 import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import { timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { AppConfig } from "./config.js";
 import { HttpError } from "./errors.js";
 import type { AgentService } from "./agent-service.js";
+import { defaultPrincipal } from "./agent-service.js";
+import type { Principal } from "./types.js";
+
+declare module "fastify" {
+  interface FastifyRequest {
+    principal: Principal;
+  }
+}
 
 const agentIdParams = z.object({ id: z.string().uuid() });
 const runIdParams = z.object({ id: z.string().uuid() });
@@ -22,6 +30,9 @@ const updateAgentBody = createAgentBody.partial().refine(
 const messageBody = z.object({
   content: z.string().trim().min(1).max(50_000),
 });
+const auditQuery = z.object({
+  agentId: z.string().uuid().optional(),
+});
 
 export async function createApp(
   config: AppConfig,
@@ -30,7 +41,11 @@ export async function createApp(
   const app = Fastify({
     logger: {
       level: config.logLevel,
-      redact: ["req.headers.authorization", "req.headers.cookie"],
+      redact: [
+        "req.headers.authorization",
+        "req.headers.cookie",
+        "req.headers.x-mock-user",
+      ],
     },
     bodyLimit: 1_048_576,
   });
@@ -42,7 +57,27 @@ export async function createApp(
         : false,
   });
 
-  app.addHook("onRequest", async (request, reply) => {
+  app.addHook("onRequest", async (request: FastifyRequest, reply) => {
+    // Attach the human principal for /api/ routes. X-Mock-User is the mock
+    // identity (the brief permits a small mock identity model); when absent the
+    // synthetic "default" principal preserves the baseline single-user flow.
+    if (request.url.startsWith("/api/")) {
+      const header = request.headers["x-mock-user"];
+      const raw = Array.isArray(header) ? header[0] : header;
+      const userId =
+        typeof raw === "string" && raw.trim().length > 0 ? raw.trim() : "default";
+      request.principal = {
+        kind: "human",
+        id: "user:" + userId,
+        userId,
+        runId: undefined,
+        scopes: [],
+        expiresAt: undefined,
+      };
+    }
+
+    // Shared operator bearer token (NOT identity). Kept separate from the
+    // human principal above.
     if (
       !config.authToken ||
       !request.url.startsWith("/api/") ||
@@ -72,60 +107,72 @@ export async function createApp(
 
   app.get("/api/system", async () => service.systemInfo());
 
-  app.get("/api/agents", async () => ({ agents: service.listAgents() }));
+  app.get("/api/agents", async (request) => ({
+    agents: service.listAgents(request.principal ?? defaultPrincipal()),
+  }));
 
   app.post("/api/agents", async (request, reply) => {
     const body = createAgentBody.parse(request.body);
-    const agent = await service.createAgent(body);
+    const agent = await service.createAgent(body, request.principal);
     return reply.code(201).send({ agent });
   });
 
   app.get("/api/agents/:id", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return { agent: service.getAgent(id) };
+    return { agent: service.getAgent(id, request.principal) };
   });
 
   app.patch("/api/agents/:id", async (request) => {
     const { id } = agentIdParams.parse(request.params);
     const body = updateAgentBody.parse(request.body);
-    return { agent: await service.updateAgent(id, body) };
+    return { agent: await service.updateAgent(id, body, request.principal) };
   });
 
   app.delete("/api/agents/:id", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return service.deleteAgent(id);
+    return service.deleteAgent(id, request.principal);
   });
 
   app.post("/api/agents/:id/start", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return { agent: await service.startAgent(id) };
+    return { agent: await service.startAgent(id, request.principal) };
   });
 
   app.post("/api/agents/:id/stop", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return { agent: await service.stopAgent(id) };
+    return { agent: await service.stopAgent(id, request.principal) };
+  });
+
+  app.post("/api/agents/:id/revoke-credential", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    return service.revokeCredential(id, request.principal);
   });
 
   app.get("/api/agents/:id/messages", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return { messages: service.getMessages(id) };
+    return { messages: service.getMessages(id, request.principal) };
   });
 
   app.get("/api/agents/:id/runs", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return { runs: service.getRuns(id) };
+    return { runs: service.getRuns(id, request.principal) };
   });
 
   app.post("/api/agents/:id/messages", async (request, reply) => {
     const { id } = agentIdParams.parse(request.params);
     const body = messageBody.parse(request.body);
-    const result = await service.sendMessage(id, body.content);
+    const result = await service.sendMessage(id, body.content, request.principal);
     return reply.code(202).send(result);
   });
 
   app.get("/api/runs/:id", async (request) => {
     const { id } = runIdParams.parse(request.params);
-    return { run: service.getRun(id) };
+    return { run: service.getRun(id, request.principal) };
+  });
+
+  app.get("/api/audit", async (request) => {
+    const query = auditQuery.parse(request.query);
+    return { audit: service.listAudit(query.agentId, request.principal) };
   });
 
   if (config.nodeEnv === "production") {
