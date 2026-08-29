@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, setAuthToken } from "./api";
-import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import { api, ApiError, setAuthToken, setMockUser } from "./api";
+import type { Agent, AgentRun, Audit, Message, SystemInfo } from "./types";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -49,6 +49,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [authRequired, setAuthRequired] = useState<boolean | null>(null);
   const [authInput, setAuthInput] = useState("");
+  const [currentUser, setCurrentUser] = useState("default");
+  const [audit, setAudit] = useState<Audit[]>([]);
   const messageEnd = useRef<HTMLDivElement>(null);
   const selectedIdRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
@@ -97,16 +99,25 @@ export default function App() {
   }, [bootstrap]);
 
   useEffect(() => {
+    setMockUser(currentUser);
+    void refreshAgents().catch((reason) =>
+      setError(reason instanceof Error ? reason.message : String(reason)),
+    );
+  }, [currentUser, refreshAgents]);
+
+  useEffect(() => {
     setActiveRun(null);
     setShowSettings(false);
+    setAudit([]);
     if (!selectedId) {
       setMessages([]);
       return;
     }
-    void Promise.all([refreshMessages(selectedId), api.runs(selectedId)])
-      .then(([, result]) => {
+    void Promise.all([refreshMessages(selectedId), api.runs(selectedId), api.audit(selectedId)])
+      .then(([, runsResult, auditResult]) => {
         if (selectedIdRef.current !== selectedId) return;
-        const latest = result.runs[0] ?? null;
+        setAudit(auditResult.audit);
+        const latest = runsResult.runs[0] ?? null;
         setActiveRun(latest);
         if (latest && ["queued", "running"].includes(latest.status)) {
           void pollRun(latest.id, selectedId).catch((reason) =>
@@ -201,6 +212,21 @@ export default function App() {
     }
   };
 
+  const revokeCredential = async () => {
+    if (!selected) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.revokeCredential(selected.id);
+      const result = await api.audit(selected.id);
+      if (selectedIdRef.current === selected.id) setAudit(result.audit);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const pollRun = async (runId: string, agentId: string) => {
     if (pollingRunIds.current.has(runId)) return;
     pollingRunIds.current.add(runId);
@@ -211,7 +237,12 @@ export default function App() {
         const result = await api.run(runId);
         if (selectedIdRef.current === agentId) setActiveRun(result.run);
         if (!["queued", "running"].includes(result.run.status)) {
-          await Promise.all([refreshMessages(agentId), refreshAgents()]);
+          const [, , auditResult] = await Promise.all([
+            refreshMessages(agentId),
+            refreshAgents(),
+            api.audit(agentId),
+          ]);
+          if (selectedIdRef.current === agentId) setAudit(auditResult.audit);
           return;
         }
       }
@@ -321,6 +352,21 @@ export default function App() {
           </div>
         </div>
 
+        <div className="user-switcher">
+          <span className="eyebrow">Mock user</span>
+          <select
+            value={currentUser}
+            onChange={(event) => {
+              setCurrentUser(event.target.value);
+              setSelectedId(null);
+            }}
+          >
+            <option value="default">default</option>
+            <option value="alice">alice</option>
+            <option value="bob">bob</option>
+          </select>
+        </div>
+
         <button
           className="button button-primary create-button"
           onClick={() => {
@@ -416,6 +462,13 @@ export default function App() {
                   disabled={busy}
                 >
                   {selected.status === "stopped" ? "Start" : "Stop"}
+                </button>
+                <button
+                  className="button button-ghost"
+                  onClick={revokeCredential}
+                  disabled={busy || selected.status === "busy"}
+                >
+                  Revoke
                 </button>
                 <button
                   className="button button-danger"
@@ -581,6 +634,76 @@ export default function App() {
                   </button>
                 </div>
               </form>
+            </section>
+
+            <section
+              className="audit-panel"
+              style={{
+                marginTop: 16,
+                padding: "16px 20px",
+                border: "1px solid rgba(255,255,255,.08)",
+                borderRadius: 14,
+              }}
+            >
+              <div className="playground-topbar" style={{ marginBottom: 12 }}>
+                <div>
+                  <span className="eyebrow">Bouncer audit</span>
+                  <h2>Policy decisions</h2>
+                </div>
+                <div className="session-info">
+                  {audit.length} decision{audit.length === 1 ? "" : "s"}
+                </div>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {audit.length === 0 ? (
+                  <div style={{ color: "rgba(255,255,255,.5)", fontSize: 13 }}>
+                    No policy decisions recorded for this Agent yet. Send a prompt that asks the
+                    Agent to curl the mock resource service.
+                  </div>
+                ) : (
+                  audit.map((row) => (
+                    <div
+                      key={row.id}
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "auto auto 1fr auto auto",
+                        gap: 8,
+                        alignItems: "center",
+                        padding: "6px 8px",
+                        borderRadius: 8,
+                        background:
+                          row.decision === "deny"
+                            ? "rgba(255,80,80,.08)"
+                            : "rgba(80,220,120,.06)",
+                      }}
+                    >
+                      <span
+                        className={"mini-dot mini-" + (row.decision === "allow" ? "ready" : "error")}
+                      />
+                      <strong
+                        style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: ".04em" }}
+                      >
+                        {row.decision}
+                      </strong>
+                      <span
+                        style={{
+                          fontSize: 13,
+                          fontFamily: "monospace",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {row.method ?? "—"} {row.resource}
+                      </span>
+                      <span style={{ fontSize: 12, opacity: 0.7 }}>{row.reason}</span>
+                      <span style={{ fontSize: 12, opacity: 0.5 }}>
+                        {formatTime(row.timestamp)}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
             </section>
           </>
         ) : (

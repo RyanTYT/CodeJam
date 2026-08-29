@@ -7,6 +7,7 @@ export interface Agent {
   description: string;
   instructions: string;
   status: AgentStatus;
+  ownerId?: string;
   workspacePath: string;
   codexThreadId: string | null;
   lastError: string | null;
@@ -38,6 +39,21 @@ export interface AgentRun {
   createdAt: string;
 }
 
+export interface Audit {
+  id: string;
+  timestamp: string;
+  humanPrincipalId: string;
+  agentId: string | null;
+  agentPrincipalId: string | null;
+  runId: string | null;
+  method: string | null;
+  action: string;
+  resource: string;
+  scope: string | null;
+  decision: "allow" | "deny";
+  reason: string;
+}
+
 export interface SystemInfo {
   arkConfigured: boolean;
   arkBaseUrl: string;
@@ -47,4 +63,5 @@ export interface SystemInfo {
   runtimeProvider: "local-process" | "container";
   containerEngine: string | null;
   runtime: string;
+  mockResourcePort?: number;
 }

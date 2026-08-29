@@ -1,4 +1,4 @@
-import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import type { Agent, AgentRun, Audit, Message, SystemInfo } from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -10,15 +10,21 @@ export class ApiError extends Error {
 }
 
 let authToken = "";
+let mockUser = "";
 
 export function setAuthToken(token: string): void {
   authToken = token.trim();
+}
+
+export function setMockUser(user: string): void {
+  mockUser = user.trim();
 }
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const headers = {
     ...(options?.body ? { "Content-Type": "application/json" } : {}),
     ...(authToken ? { Authorization: "Bearer " + authToken } : {}),
+    ...(mockUser ? { "X-Mock-User": mockUser } : {}),
     ...options?.headers,
   };
   const response = await fetch(url, {
@@ -65,6 +71,10 @@ export const api = {
     request<{ agent: Agent }>("/api/agents/" + id + "/stop", {
       method: "POST",
     }),
+  revokeCredential: (id: string) =>
+    request<{ revoked: boolean }>("/api/agents/" + id + "/revoke-credential", {
+      method: "POST",
+    }),
   messages: (id: string) =>
     request<{ messages: Message[] }>("/api/agents/" + id + "/messages"),
   runs: (id: string) =>
@@ -78,4 +88,8 @@ export const api = {
       },
     ),
   run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),
+  audit: (agentId?: string) =>
+    request<{ audit: Audit[] }>(
+      "/api/audit" + (agentId ? "?agentId=" + encodeURIComponent(agentId) : ""),
+    ),
 };
