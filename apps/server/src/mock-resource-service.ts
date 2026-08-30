@@ -1,7 +1,16 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import type { JsonStore } from "./store.js";
-import type { AgentCredential, Audit, DeployState, MockResource } from "./types.js";
+import type { 
+  AgentCredential, 
+  Audit, 
+  AuthorizationContext,
+  AuthorizationDecision,
+  Capability,
+  DeployState, 
+  MockResource, 
+  RequestedCapability,
+ } from "./types.js";
 
 const now = () => new Date().toISOString();
 const TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
@@ -175,10 +184,17 @@ export class MockResourceService {
   }
 
   /**
-   * Boundary 3 — the policy-enforcing relay. Validates the Tier 1 token (injected
-   * by the egress proxy), derives the required scope, checks the agent's scopes,
-   * reaches the protected data, and returns a redacted envelope. Every path
-   * writes an Audit row; on a deny the upstream is never contacted.
+   * Boundary 3 — the policy-enforcing relay.
+   * 
+   * Flow: 
+   * 1. Validate Tier 1 credential (injected by the egress proxy)
+   * 2. Derive resource scope for response handling 
+   * 3. Normalize credential into AuthorizationContext
+   * 4. Derive requested capability
+   * 5. Authorize capability
+   * 6. Only then reach the protected resource
+   * 7. Redact response
+   * 8. Audit the decision
    */
   async relay(
     method: string,
@@ -186,25 +202,75 @@ export class MockResourceService {
     body: unknown,
     token: string | undefined,
   ): Promise<RelayResult> {
+
+    // 1. Validate Tier 1 credential
     if (!token) {
       await this.auditDeny(method, path, null, "missing token", null);
       return { status: 401, body: { error: "missing token" } };
     }
+
+    // 2. Authentication / Credential validation
     const credential = this.validateToken(token);
+
     if (!credential) {
       await this.auditDeny(method, path, null, "invalid or revoked token", null);
       return { status: 401, body: { error: "invalid or revoked token" } };
     }
+
+    // Handle Reources and redaction
     const scope = this.deriveScope(method, path);
     if (!scope) {
       await this.auditDeny(method, path, credential, "unknown resource", null);
       return { status: 404, body: { error: "unknown resource" } };
     }
-    if (!credential.scopes.includes(scope.scope)) {
-      await this.auditDeny(method, path, credential, "scope mismatch", scope.scope);
-      return { status: 403, body: { error: "scope mismatch", scope: scope.scope } };
+    // if (!credential.scopes.includes(scope.scope)) {
+    //   await this.auditDeny(method, path, credential, "scope mismatch", scope.scope);
+    //   return { status: 403, body: { error: "scope mismatch", scope: scope.scope } };
+    // }
+
+    // 3. Normalize credential into AuthorizationContext
+    const context = this.credentialToContext(credential);
+
+    // 4. Derive requested capability
+    const requestedCapability = this.scopeToRequestedCapability(scope);
+
+    if (!requestedCapability){
+      await this.auditDeny(
+        method, 
+        path, 
+        credential, 
+        "unknown capability", 
+        null,
+      )
+
+      return {
+        status: 404, 
+        body: { error: "unknown resource" },
+      }
     }
 
+    // 5. Authorize capability
+    const decision = this.authorize(context, requestedCapability);
+
+    if (!decision.allowed){
+      await this.auditDeny(
+        method, 
+        path, 
+        credential, 
+        "capability not granted", 
+        requestedCapability.scope,
+      );
+
+      return {
+        status: 403, 
+        body: {
+          error: "capability not granted", 
+          capability: requestedCapability.scope,
+        }
+      }
+    }
+
+    // 6. Protected resource
     const upstream = await this.handleUpstream(method, path, body);
     const redacted = this.redactEnvelope(scope, upstream);
 
@@ -212,6 +278,9 @@ export class MockResourceService {
       humanPrincipalId: "user:" + credential.ownerId,
       agentId: credential.agentId,
       agentPrincipalId: "agent:" + credential.agentId,
+      planId: "", // TODO: Add planId to audit
+      planHash: "", // TODO: Add planHash to audit
+      capability: "", // TODO: Add capability to audit
       runId: credential.runId,
       method,
       action: scope.verb,
@@ -326,6 +395,9 @@ export class MockResourceService {
       humanPrincipalId: credential ? "user:" + credential.ownerId : "unknown",
       agentId: credential?.agentId ?? null,
       agentPrincipalId: credential ? "agent:" + credential.agentId : null,
+      planId: "", // TODO: add planId to audit
+      planHash: "", // TODO: add planHash to audit
+      capability: "", // TODO: add capability
       runId: credential?.runId ?? null,
       method,
       action: derived?.verb ?? "unknown",
@@ -336,9 +408,128 @@ export class MockResourceService {
     });
   }
 
+  /* Normalizes the current AgentCredential representation into the 
+  representation consumed by the enforcement point
+
+  The enforcement logic should NOT depend directly on AgentCredential.scopes
+  This adapter is the seam that allows plan-bound capabilities to be introduced
+  later
+  */
+  private credentialToContext(
+    credential: AgentCredential
+  ): AuthorizationContext {
+    return {
+      agentId: credential.agentId,
+      runId: credential.runId,
+      ownerId: credential.ownerId, 
+      
+      // Calls the intent bounding capabilities function
+      capabilities: credential.scopes?.map(
+        (scope) => this.scopeToCapability(scope)) ?? [],
+      
+
+      expiresAt: credential.expiresAt,
+    };
+  }
+
+  /* Convert string-based scope into the normalized
+  capability representation. 
+  */
+  private scopeToCapability(scope: string): Capability {
+    const parts = scope.split(":");
+
+    if (parts.length !== 3) {
+      throw new Error(`Invalid capability scope: ${scope}`);
+    }
+
+    const [action, resource, target] = parts;
+
+    if (
+      action !== "read" &&
+      action !== "write" &&
+      action !== "act"
+    ) {
+      throw new Error(`Invalid capability action: ${action}`);
+    }
+
+    if (!resource){
+      throw new Error(`Invalid capability resource: ${resource}`);
+    }
+
+    if (!target){
+      throw new Error(`Invalid capability scope: ${target}`);
+    }
+
+      return {
+        action,
+        resource,
+        scope: target,
+      };
+  }
+
+  private scopeToRequestedCapability(
+    scope: DerivedScope,
+  ): RequestedCapability {
+    const [action, resource, target] = scope.scope.split(":");
+
+    if (
+      action !== "read" &&
+      action !== "write" &&
+      action !== "act"
+    ) {
+      throw new Error(`Invalid derived scope: ${scope.scope}`);
+    }
+
+    if(!resource || !target) {
+      throw new Error(`Invalid derived scope: ${scope.scope}`);
+    }
+
+    return {
+      action, 
+      resource, 
+      scope: target,
+    }
+  }
+
+  /* Enforcement decision
+
+  This function intentionally knows nothing about AgentCredential, 
+  tokens, JWTs, plan compilers, or how capabilities were created
+
+  It only answers: "Does this authorization context contain the
+  capability required by this request?"
+   */
+  authorize(
+    context: AuthorizationContext,
+    requested: RequestedCapability,
+  ): AuthorizationDecision {
+    const matchedCapability = context.capabilities.find(
+      (capability) => 
+        capability.action === requested.action &&
+        capability.resource === requested.resource &&
+        capability.scope === requested.scope,
+    );
+
+    if (!matchedCapability){
+      return {
+        allowed: false, 
+        reason: "capability_not_granted", 
+        requiredCapability: requested,
+      };
+    }
+    
+    return {
+      allowed: true, 
+      reason: "capability_granted", 
+      requiredCapability: requested, 
+      matchedCapability,
+    };
+  }
+
   listAudit(agentId?: string): Audit[] {
     const all = this.store.snapshot().audit;
     const filtered = agentId ? all.filter((entry) => entry.agentId === agentId) : all;
     return [...filtered].sort((left, right) => right.timestamp.localeCompare(left.timestamp));
   }
+
 }

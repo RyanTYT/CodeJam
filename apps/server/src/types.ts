@@ -93,6 +93,54 @@ export interface DeployState {
   deployed: boolean;
 }
 
+// Normalized authorization capability
+// Independent of how capability was produced and comes
+// from AgentCredential.scopes and later can come from
+// A plan/compiler-generated capability grant
+export interface Capability {
+  action: "read" | "write" | "act";
+  resource: string;
+  scope: string;
+}
+
+// Normalized authorization context consumed by 
+// enforcement point
+export interface AuthorizationContext {
+  agentId: string;
+  runId: string;
+  ownerId: string;
+
+  capabilities: Capability[];
+
+  // Temporarily Optional since the current
+  // credential model does not have plan
+  // binding yet
+  planId?: string;
+  planHash?: string;
+
+  credentialId?: string;
+  expiresAt: string;
+}
+
+// Capability required by an incoming
+// resource request
+export interface RequestedCapability {
+  action: "read" | "write" | "act";
+  resource: string;
+  scope: string;
+}
+
+// Result returned by the authorization check
+export interface AuthorizationDecision {
+  allowed: boolean;
+  reason: | "capability_granted" | "capability_not_granted";
+
+  requiredCapability: RequestedCapability;
+
+  // Present when a granted capability matched the request
+  matchedCapability?: Capability;
+}
+
 export interface Audit {
   id: string;
   timestamp: string;
@@ -100,6 +148,9 @@ export interface Audit {
   agentId: string | null;
   agentPrincipalId: string | null;
   runId: string | null;
+  planId?: string | null;
+  planHash?: string | null;
+  capability?: string | null;
   method: string | null;
   action: string;
   resource: string;
