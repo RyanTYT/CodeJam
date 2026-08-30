@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken, setMockUser } from "./api";
-import type { Agent, AgentRun, Audit, IntentPlan, Message, SystemInfo } from "./types";
+import type { Agent, AgentRun, Audit, IntentPlan, Message, SystemInfo, WorkflowNode } from "./types";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -63,6 +63,7 @@ export default function App() {
   const [authInput, setAuthInput] = useState("");
   const [currentUser, setCurrentUser] = useState("default");
   const [audit, setAudit] = useState<Audit[]>([]);
+  const [workflow, setWorkflow] = useState<WorkflowNode[]>([]);
   const [intent, setIntent] = useState("");
   const [plan, setPlan] = useState<IntentPlan | null>(null);
   const [approvedElevated, setApprovedElevated] = useState<Set<string>>(new Set());
@@ -78,6 +79,17 @@ export default function App() {
     () => agents.find((agent) => agent.id === selectedId) ?? null,
     [agents, selectedId],
   );
+
+  const workflowByParent = useMemo(() => {
+    const next = new Map<string | undefined, WorkflowNode[]>();
+    for (const node of workflow) {
+      const key = node.parentId ?? "root";
+      const existing = next.get(key) ?? [];
+      existing.push(node);
+      next.set(key, existing);
+    }
+    return next;
+  }, [workflow]);
 
   const refreshAgents = useCallback(async () => {
     const { agents: next } = await api.listAgents();
@@ -126,16 +138,27 @@ export default function App() {
     setActiveRun(null);
     setShowSettings(false);
     setAudit([]);
+    setWorkflow([]);
     if (!selectedId) {
       setMessages([]);
       return;
     }
     void Promise.all([refreshMessages(selectedId), api.runs(selectedId), api.audit(selectedId)])
-      .then(([, runsResult, auditResult]) => {
+      .then(async ([, runsResult, auditResult]) => {
         if (selectedIdRef.current !== selectedId) return;
         setAudit(auditResult.audit);
         const latest = runsResult.runs[0] ?? null;
         setActiveRun(latest);
+        if (latest) {
+          try {
+            const workflowResult = await api.workflow(latest.id);
+            if (selectedIdRef.current === selectedId) {
+              setWorkflow(workflowResult.workflow);
+            }
+          } catch (reason) {
+            setError(reason instanceof Error ? reason.message : String(reason));
+          }
+        }
         if (latest && ["queued", "running"].includes(latest.status)) {
           void pollRun(latest.id, selectedId).catch((reason) =>
             setError(reason instanceof Error ? reason.message : String(reason)),
@@ -324,9 +347,11 @@ export default function App() {
         if (!mountedRef.current) return;
         const result = await api.run(runId);
         const auditResult = await api.audit(agentId);
+        const workflowResult = await api.workflow(runId);
         if (selectedIdRef.current === agentId) {
           setActiveRun(result.run);
           setAudit(auditResult.audit);
+          setWorkflow(workflowResult.workflow);
         }
         if (!["queued", "running"].includes(result.run.status)) {
           await Promise.all([refreshMessages(agentId), refreshAgents()]);
@@ -849,6 +874,84 @@ export default function App() {
                   </div>
                 </details>
               )}
+            </div>
+
+            {/* Workflow hierarchy */}
+            <div style={{ marginBottom: 16 }}>
+              <div className="playground-topbar" style={{ marginBottom: 8 }}>
+                <div>
+                  <span className="eyebrow">Workflow</span>
+                </div>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {workflow.length === 0 ? (
+                  <div style={{ color: "rgba(255,255,255,.5)", fontSize: 12 }}>
+                    No workflow data yet.
+                  </div>
+                ) : (
+                  (workflowByParent.get("root") ?? []).map((node) => {
+                    const renderNode = (current: WorkflowNode, depth = 0) => {
+                      const children = workflow.filter((child) => child.parentId === current.id);
+                      const riskColor =
+                        current.riskLevel === "high"
+                          ? "rgba(255,120,120,.18)"
+                          : current.riskLevel === "medium"
+                            ? "rgba(255,200,90,.16)"
+                            : "rgba(110,220,140,.12)";
+
+                      return (
+                        <div key={current.id} style={{ marginLeft: depth * 12 }}>
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 8,
+                              padding: "6px 8px",
+                              borderRadius: 8,
+                              background: riskColor,
+                              fontSize: 12,
+                            }}
+                          >
+                            <span
+                              style={{
+                                width: 8,
+                                height: 8,
+                                borderRadius: "50%",
+                                background:
+                                  current.status === "running"
+                                    ? "#80c7ff"
+                                    : current.status === "completed"
+                                      ? "#7fe3a5"
+                                      : current.status === "failed"
+                                        ? "#ff7a7a"
+                                        : "#ffd166",
+                              }}
+                            />
+                            <strong style={{ fontSize: 10, textTransform: "uppercase" }}>
+                              {current.type}
+                            </strong>
+                            <span style={{ opacity: 0.8 }}>{current.status}</span>
+                            <span
+                              style={{
+                                marginLeft: "auto",
+                                padding: "2px 6px",
+                                borderRadius: 999,
+                                background: "rgba(255,255,255,.08)",
+                                fontSize: 10,
+                                textTransform: "uppercase",
+                              }}
+                            >
+                              {current.riskLevel}
+                            </span>
+                          </div>
+                          {children.map((child) => renderNode(child, depth + 1))}
+                        </div>
+                      );
+                    };
+                    return renderNode(node);
+                  })
+                )}
+              </div>
             </div>
 
             {/* Decisions timeline */}

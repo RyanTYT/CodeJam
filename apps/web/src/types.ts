@@ -63,6 +63,20 @@ export interface Audit {
   parentNodeId?: string;
 }
 
+export type RiskLevel = "low" | "medium" | "high";
+
+export interface WorkflowNode {
+  id: string;
+  type: "orchestrator" | "agent" | "task";
+  parentId?: string;
+  runId: string;
+  agentId?: string;
+  status: "queued" | "running" | "completed" | "failed" | "pending_approval";
+  riskLevel: RiskLevel;
+  createdAt: string;
+  completedAt?: string;
+}
+
 export interface SystemInfo {
   arkConfigured: boolean;
   arkBaseUrl: string;

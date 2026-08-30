@@ -1,4 +1,4 @@
-import type { Agent, AgentRun, Audit, IntentPlan, Message, SystemInfo } from "./types";
+import type { Agent, AgentRun, Audit, IntentPlan, Message, SystemInfo, WorkflowNode } from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -100,8 +100,8 @@ export const api = {
         body: JSON.stringify({ content }),
       },
     ),
-  run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),
-  audit: (agentId?: string) =>
+  run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),  workflow: (runId: string) =>
+    request<{ workflow: WorkflowNode[] }>("/api/runs/" + runId + "/workflow"),  audit: (agentId?: string) =>
     request<{ audit: Audit[] }>(
       "/api/audit" + (agentId ? "?agentId=" + encodeURIComponent(agentId) : ""),
     ),
