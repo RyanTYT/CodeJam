@@ -2,10 +2,11 @@ import { mkdtemp } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadConfig } from "./config.js";
-import { createMockApp } from "./mock-resource-server.js";
-import { MockResourceService } from "./mock-resource-service.js";
-import { JsonStore } from "./store.js";
+import { loadConfig } from "../config.js";
+import { AuthorizationContext } from "../types.js";
+import { createMockApp } from "../mock-resource-server.js";
+import { MockResourceService } from "../mock-resource-service.js";
+import { JsonStore } from "../store.js";
 
 const temporaryDirectories: string[] = [];
 const TIER2 = "real-upstream-secret-min-24-chars";
@@ -80,8 +81,8 @@ describe("boundary 3 — relay policy", () => {
     );
     const deny = service
       .listAudit("agent-1")
-      .find((row) => row.decision === "deny" && row.reason === "scope mismatch");
-    expect(deny).toBeTruthy();
+      .find((row) => row.decision === "deny" && row.reason === "capability not granted");
+      expect(deny).toBeTruthy();
   });
 
   it("denies a revoked credential with 401 and audits the denial", async () => {
@@ -190,4 +191,129 @@ describe("boundary 3 — HTTP routes", () => {
       await app.close();
     }
   });
+
+  // Enforcement Point Test Cases
+  it("converts credential scopes into capabilities", async() => {
+    const credential = {
+      tokenHash: "test",
+      agentId: "agent-1",
+      runId: "run-1",
+      ownerId: "alice",
+      scopes: [
+        "read:secrets:alice",
+        "act:deploy:dev",
+      ],
+      issuedAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      revokedAt: null,
+    };
+    const { service } = await makeService();
+
+    const context =
+      service.credentialToContext(credential);
+
+    expect(context.capabilities).toEqual([
+      {
+        action: "read",
+        resource: "secrets",
+        scope: "alice",
+      },
+      {
+        action: "act",
+        resource: "deploy",
+        scope: "dev",
+      },
+    ]);
+  });
+
+  it("denies a capability that is not granted", async() => {
+    const { service } = await makeService();
+    const context: AuthorizationContext = {
+      agentId: "agent-1",
+      runId: "run-1",
+      ownerId: "alice",
+      capabilities: [
+        {
+          action: "act",
+          resource: "deploy",
+          scope: "dev",
+        },
+      ],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+
+    const decision = service.authorize(context, {
+      action: "act",
+      resource: "deploy",
+      scope: "prod",
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe("capability_not_granted");
+  });
+
+  it("does not treat read capability as write capability", async() => {
+    const { service } = await makeService();
+    const context: AuthorizationContext = {
+      agentId: "agent-1",
+      runId: "run-1",
+      ownerId: "alice",
+      capabilities: [
+        {
+          action: "read",
+          resource: "secrets",
+          scope: "alice",
+        },
+      ],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+
+    const decision = service.authorize(context, {
+      action: "write",
+      resource: "secrets",
+      scope: "alice",
+    });
+
+    expect(decision.allowed).toBe(false);
+  });
+
+  it("does not allow a dev deployment capability to deploy to prod", async() => { 
+    const { service } = await makeService(); 
+    const context: AuthorizationContext = { 
+      agentId: "agent-1", 
+      runId: "run-1", 
+      ownerId: "alice", 
+      capabilities: [ 
+        { action: "act", resource: "deploy", scope: "dev", }, 
+      ], 
+      expiresAt: new Date(Date.now() + 60_000).toISOString(), 
+    }; 
+    const decision = service.authorize(context, 
+      { action: "act", resource: "deploy", scope: "prod", }
+    ); 
+    expect(decision.allowed).toBe(false); 
+  }); 
+  
+  it("evaluates capabilities independently", async() => { 
+    const { service } = await makeService();  
+    const context: AuthorizationContext = {
+      agentId: "agent-1", 
+      runId: "run-1", 
+      ownerId: "alice", 
+      capabilities: [ 
+        { action: "read", resource: "secrets", scope: "alice", },
+        { action: "act", resource: "deploy", scope: "dev", }, 
+      ], 
+      expiresAt: new Date(Date.now() + 60_000).toISOString(), 
+    }; 
+    expect( service.authorize(context, 
+      { action: "read", resource: "secrets", scope: "alice", }).allowed, 
+    ).toBe(true); 
+    expect( service.authorize(context, 
+      { action: "act", resource: "deploy", scope: "prod", }).allowed, 
+    ).toBe(false); 
+    expect( service.authorize(context, 
+      { action: "write", resource: "secrets", scope: "alice", }).allowed,
+     ).toBe(false); });
+
 });

@@ -415,7 +415,7 @@ export class MockResourceService {
   This adapter is the seam that allows plan-bound capabilities to be introduced
   later
   */
-  private credentialToContext(
+  credentialToContext(
     credential: AgentCredential
   ): AuthorizationContext {
     return {

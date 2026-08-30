@@ -1,6 +1,6 @@
 import * as http from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
-import { startEgressProxy, type EgressProxy } from "./egress-proxy.js";
+import { startEgressProxy, type EgressProxy } from "../egress-proxy.js";
 
 const proxies: EgressProxy[] = [];
 const upstreams: { close: () => Promise<void> }[] = [];
