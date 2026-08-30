@@ -19,6 +19,7 @@ import type {
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
+import { calculateAgentRiskProfile } from "./risk-engine.js";
 
 const now = () => new Date().toISOString();
 
@@ -117,7 +118,13 @@ export class AgentService {
       updatedAt: timestamp,
     };
     await this.workspaces.create(agent);
-    await this.store.mutate((database) => database.agents.push(agent));
+    await this.store.mutate((database) => {
+      database.agents.push(agent);
+      
+      // Phase 2: Calculate and store initial risk profile
+      const riskProfile = calculateAgentRiskProfile(agent, []);
+      database.agentRiskProfiles.push(riskProfile);
+    });
     await this.audit(
       principal,
       agent.id,
