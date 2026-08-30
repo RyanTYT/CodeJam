@@ -32,9 +32,10 @@ describe("IntentPlanner (fallback — Ark is not configured in tests)", () => {
     const plan = await planner.plan(
       "build a todo app that reads my DB url and deploys to dev",
       "alice",
+      ["db-url"],
     );
     expect(plan.source).toBe("fallback");
-    expect(plan.baselineScopes).toContain("read:secrets:alice");
+    expect(plan.baselineScopes).toContain("read:secrets:alice/db-url");
     expect(plan.baselineScopes).toContain("act:deploy:dev");
     expect(plan.elevatedScopes).toEqual([]);
     expect(plan.unknownScopes).toEqual([]);
@@ -44,8 +45,9 @@ describe("IntentPlanner (fallback — Ark is not configured in tests)", () => {
     const plan = await planner.plan(
       "migrate the prod DB and deploy to prod",
       "alice",
+      ["db-url"],
     );
-    expect(plan.elevatedScopes).toContain("write:secrets:alice");
+    expect(plan.elevatedScopes).toContain("write:secrets:alice/db-url");
     expect(plan.elevatedScopes).toContain("act:deploy:prod");
   });
 

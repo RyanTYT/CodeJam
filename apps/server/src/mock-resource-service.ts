@@ -1,16 +1,19 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import type { JsonStore } from "./store.js";
-import type { 
-  AgentCredential, 
-  Audit, 
+import { encrypt, decrypt } from "./secret-cipher.js";
+import type {
+  AgentCredential,
+  Audit,
   AuthorizationContext,
   AuthorizationDecision,
   Capability,
-  DeployState, 
-  MockResource, 
+  DeployState,
+  MockResource,
   RequestedCapability,
- } from "./types.js";
+  Secret,
+  User,
+} from "./types.js";
 
 const now = () => new Date().toISOString();
 const TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
@@ -92,10 +95,24 @@ export class MockResourceService {
   async initialize(): Promise<void> {
     await this.store.mutate((db) => {
       if (db.mockResources.length === 0) {
-        db.mockResources.push(...SEED_RESOURCES.map((resource) => ({ ...resource })));
+        db.mockResources.push(
+          ...SEED_RESOURCES.map((resource) => ({
+            ...resource,
+            value: encrypt(resource.value, this.config.secretsKey),
+          })),
+        );
       }
       if (db.deployStates.length === 0) {
         db.deployStates.push(...SEED_DEPLOYS.map((state) => ({ ...state })));
+      }
+      if (db.users.length === 0) {
+        const timestamp = now();
+        db.users.push(
+          { id: randomUUID(), userId: "admin", role: "admin", createdAt: timestamp },
+          { id: randomUUID(), userId: "default", role: "user", createdAt: timestamp },
+          { id: randomUUID(), userId: "alice", role: "user", createdAt: timestamp },
+          { id: randomUUID(), userId: "bob", role: "user", createdAt: timestamp },
+        );
       }
     });
   }
@@ -109,11 +126,13 @@ export class MockResourceService {
     const token = randomBytes(32).toString("base64url");
     const issuedAt = now();
     const expiresAt = new Date(Date.now() + TOKEN_TTL_MS).toISOString();
+    const role = this.store.snapshot().users.find((u) => u.userId === ownerId)?.role ?? "user";
     const credential: AgentCredential = {
       tokenHash: hashToken(token),
       agentId,
       runId,
       ownerId,
+      role,
       scopes,
       issuedAt,
       expiresAt,
@@ -150,6 +169,94 @@ export class MockResourceService {
   }
 
   /**
+   * Vault — owner-managed key:value secrets. The value is encrypted at rest
+   * (AES-256-GCM) and is never returned by any of these methods; only the
+   * redacted view is exposed. The relay's `handleUpstream` is the only path
+   * that decrypts (for the Tier-2 upstream gate).
+   */
+  async addSecret(
+    owner: string,
+    key: string,
+    value: string,
+    redactedView: string | undefined,
+  ): Promise<Secret> {
+    const view = redactedView?.trim() || "•••••••• (redacted)";
+    const encrypted = encrypt(value, this.config.secretsKey);
+    await this.store.mutate((db) => {
+      const existing = db.mockResources.find(
+        (resource) => resource.owner === owner && resource.key === key,
+      );
+      if (existing) {
+        existing.value = encrypted;
+        existing.redactedView = view;
+      } else {
+        db.mockResources.push({ owner, key, value: encrypted, redactedView: view });
+      }
+    });
+    return { owner, key, redactedView: view };
+  }
+
+  /** List the owner's secrets — redacted views only, never the values. */
+  listSecrets(owner: string): Secret[] {
+    return this.store
+      .snapshot()
+      .mockResources.filter((resource) => resource.owner === owner)
+      .map((resource) => ({
+        owner: resource.owner,
+        key: resource.key,
+        redactedView: resource.redactedView,
+      }));
+  }
+
+  /** Just the secret keys — for the IntentPlanner's per-key taxonomy. */
+  listSecretKeys(owner: string): string[] {
+    return this.store
+      .snapshot()
+      .mockResources.filter((resource) => resource.owner === owner)
+      .map((resource) => resource.key);
+  }
+
+  async deleteSecret(owner: string, key: string): Promise<boolean> {
+    let removed = false;
+    await this.store.mutate((db) => {
+      const before = db.mockResources.length;
+      db.mockResources = db.mockResources.filter(
+        (resource) => !(resource.owner === owner && resource.key === key),
+      );
+      removed = db.mockResources.length < before;
+    });
+    return removed;
+  }
+
+  /** Resolve a mock-user userId to a User from the central users store. */
+  resolveUser(userId: string): User | null {
+    return this.store.snapshot().users.find((u) => u.userId === userId) ?? null;
+  }
+
+  listUsers(): User[] {
+    return [...this.store.snapshot().users].sort((a, b) =>
+      a.userId.localeCompare(b.userId),
+    );
+  }
+
+  async addUser(userId: string, role: "admin" | "user"): Promise<User> {
+    const user: User = { id: randomUUID(), userId, role, createdAt: now() };
+    await this.store.mutate((db) => {
+      db.users.push(user);
+    });
+    return user;
+  }
+
+  /** All secrets across all owners (admin view) — redacted views only. */
+  listAllSecrets(): Secret[] {
+    return this.store.snapshot().mockResources.map((resource) => ({
+      owner: resource.owner,
+      key: resource.key,
+      redactedView: resource.redactedView,
+    }));
+  }
+
+  /**
    * Derive the authorization scope required for a (method, path) pair. The HTTP
    * method is a dimension of the scope: reads need `read:`, mutating data needs
    * `write:`, and action endpoints (deploy) need `act:`.
@@ -167,7 +274,7 @@ export class MockResourceService {
         kind,
         owner,
         verb,
-        scope: `${verb}:secrets:${owner}`,
+        scope: key ? `${verb}:secrets:${owner}/${key}` : `${verb}:secrets:${owner}`,
         resource: key ? `secrets:${owner}/${key}` : `secrets:${owner}`,
       };
     }
@@ -185,10 +292,10 @@ export class MockResourceService {
 
   /**
    * Boundary 3 — the policy-enforcing relay.
-   * 
-   * Flow: 
+   *
+   * Flow:
    * 1. Validate Tier 1 credential (injected by the egress proxy)
-   * 2. Derive resource scope for response handling 
+   * 2. Derive resource scope for response handling
    * 3. Normalize credential into AuthorizationContext
    * 4. Derive requested capability
    * 5. Authorize capability
@@ -236,15 +343,15 @@ export class MockResourceService {
 
     if (!requestedCapability){
       await this.auditDeny(
-        method, 
-        path, 
-        credential, 
-        "unknown capability", 
+        method,
+        path,
+        credential,
+        "unknown capability",
         null,
       )
 
       return {
-        status: 404, 
+        status: 404,
         body: { error: "unknown resource" },
       }
     }
@@ -254,17 +361,17 @@ export class MockResourceService {
 
     if (!decision.allowed){
       await this.auditDeny(
-        method, 
-        path, 
-        credential, 
-        "capability not granted", 
+        method,
+        path,
+        credential,
+        "capability not granted",
         requestedCapability.scope,
-      );
+      )
 
       return {
-        status: 403, 
+        status: 403,
         body: {
-          error: "capability not granted", 
+          error: "capability not granted",
           capability: requestedCapability.scope,
         }
       }
@@ -320,7 +427,13 @@ export class MockResourceService {
           .snapshot()
           .mockResources.find((entry) => entry.owner === target && entry.key === key);
         if (!resource) return { status: 404, body: { error: "not found" } };
-        return { status: 200, body: structuredClone(resource) };
+        return {
+          status: 200,
+          body: {
+            ...structuredClone(resource),
+            value: decrypt(resource.value, this.config.secretsKey),
+          },
+        };
       }
       if (method === "PUT") {
         let updated = false;
@@ -329,7 +442,10 @@ export class MockResourceService {
             (resource) => resource.owner === target && resource.key === key,
           );
           if (entry) {
-            entry.value = typeof body === "string" ? body : JSON.stringify(body);
+            entry.value = encrypt(
+              typeof body === "string" ? body : JSON.stringify(body),
+              this.config.secretsKey,
+            );
             entry.redactedView = "*** redacted ***";
             updated = true;
           }
@@ -408,7 +524,7 @@ export class MockResourceService {
     });
   }
 
-  /* Normalizes the current AgentCredential representation into the 
+  /* Normalizes the current AgentCredential representation into the
   representation consumed by the enforcement point
 
   The enforcement logic should NOT depend directly on AgentCredential.scopes
@@ -421,19 +537,16 @@ export class MockResourceService {
     return {
       agentId: credential.agentId,
       runId: credential.runId,
-      ownerId: credential.ownerId, 
-      
-      // Calls the intent bounding capabilities function
+      ownerId: credential.ownerId,
+      isAdmin: credential.role === "admin",
       capabilities: credential.scopes?.map(
         (scope) => this.scopeToCapability(scope)) ?? [],
-      
-
       expiresAt: credential.expiresAt,
     };
   }
 
   /* Convert string-based scope into the normalized
-  capability representation. 
+  capability representation.
   */
   private scopeToCapability(scope: string): Capability {
     const parts = scope.split(":");
@@ -485,15 +598,15 @@ export class MockResourceService {
     }
 
     return {
-      action, 
-      resource, 
+      action,
+      resource,
       scope: target,
     }
   }
 
   /* Enforcement decision
 
-  This function intentionally knows nothing about AgentCredential, 
+  This function intentionally knows nothing about AgentCredential,
   tokens, JWTs, plan compilers, or how capabilities were created
 
   It only answers: "Does this authorization context contain the
@@ -503,25 +616,38 @@ export class MockResourceService {
     context: AuthorizationContext,
     requested: RequestedCapability,
   ): AuthorizationDecision {
+    if (context.isAdmin) {
+      return {
+        allowed: true,
+        reason: "capability_granted",
+        requiredCapability: requested,
+        matchedCapability: {
+          action: requested.action,
+          resource: requested.resource,
+          scope: requested.scope,
+        },
+      };
+    }
     const matchedCapability = context.capabilities.find(
-      (capability) => 
+      (capability) =>
         capability.action === requested.action &&
         capability.resource === requested.resource &&
-        capability.scope === requested.scope,
+        (capability.scope === requested.scope ||
+          requested.scope.startsWith(capability.scope + "/")),
     );
 
     if (!matchedCapability){
       return {
-        allowed: false, 
-        reason: "capability_not_granted", 
+        allowed: false,
+        reason: "capability_not_granted",
         requiredCapability: requested,
       };
     }
-    
+
     return {
-      allowed: true, 
-      reason: "capability_granted", 
-      requiredCapability: requested, 
+      allowed: true,
+      reason: "capability_granted",
+      requiredCapability: requested,
       matchedCapability,
     };
   }

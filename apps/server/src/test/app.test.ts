@@ -6,6 +6,15 @@ import type { AgentService } from "../agent-service.js";
 const service = {
   listAgents: () => [],
   systemInfo: async () => ({}),
+  resolvePrincipal: () => ({
+    kind: "human" as const,
+    id: "user:default",
+    userId: "default",
+    role: "user" as const,
+    runId: undefined,
+    scopes: [],
+    expiresAt: undefined,
+  }),
 } as unknown as AgentService;
 
 describe("HTTP boundary", () => {

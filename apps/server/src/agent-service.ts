@@ -16,7 +16,9 @@ import type {
   Message,
   Principal,
   RunnerRequest,
+  Secret,
   UpdateAgentInput,
+  User,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
@@ -27,6 +29,7 @@ export const defaultPrincipal = (): Principal => ({
   kind: "human",
   id: "user:default",
   userId: "default",
+  role: "user",
   runId: undefined,
   scopes: [],
   expiresAt: undefined,
@@ -140,7 +143,8 @@ export class AgentService {
     principal: Principal = defaultPrincipal(),
   ): Promise<IntentPlan> {
     const ownerId = principal.userId ?? "default";
-    const plan = await this.intentPlanner.plan(intent, ownerId);
+    const secretKeys = this.mockResourceService.listSecretKeys(ownerId);
+    const plan = await this.intentPlanner.plan(intent, ownerId, secretKeys);
     await this.audit(
       principal,
       null,
@@ -350,6 +354,85 @@ export class AgentService {
   ): Audit[] {
     if (agentId) this.getAgent(agentId, principal);
     return this.mockResourceService.listAudit(agentId);
+  }
+
+  /** Vault — owner-managed key:value secrets (encrypted at rest, redacted views only). */
+  listSecrets(principal: Principal = defaultPrincipal()): Secret[] {
+    if (principal.role === "admin") {
+      return this.mockResourceService.listAllSecrets();
+    }
+    const ownerId = principal.userId ?? "default";
+    return this.mockResourceService.listSecrets(ownerId);
+  }
+
+  async addSecret(
+    owner: string,
+    key: string,
+    value: string,
+    redactedView: string | undefined,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<Secret> {
+    if (principal.role !== "admin") {
+      throw new HttpError(403, "Only admins may manage secrets");
+    }
+    const secret = await this.mockResourceService.addSecret(owner, key, value, redactedView);
+    await this.audit(principal, null, "add-secret", `secret:${owner}/${key}`, "allow", "admin");
+    return secret;
+  }
+
+  async deleteSecret(
+    owner: string,
+    key: string,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<{ deleted: boolean }> {
+    if (principal.role !== "admin") {
+      throw new HttpError(403, "Only admins may manage secrets");
+    }
+    const deleted = await this.mockResourceService.deleteSecret(owner, key);
+    await this.audit(
+      principal,
+      null,
+      "revoke-secret",
+      `secret:${owner}/${key}`,
+      deleted ? "allow" : "deny",
+      deleted ? "admin" : "not found",
+    );
+    return { deleted };
+  }
+
+  /** Resolve a mock-user userId to a Principal (with role) from the users store, or null. */
+  resolvePrincipal(userId: string): Principal | null {
+    const user = this.mockResourceService.resolveUser(userId);
+    if (!user) return null;
+    return {
+      kind: "human",
+      id: "user:" + user.userId,
+      userId: user.userId,
+      role: user.role,
+      runId: undefined,
+      scopes: [],
+      expiresAt: undefined,
+    };
+  }
+
+  listUsers(): User[] {
+    return this.mockResourceService.listUsers();
+  }
+
+  async addUser(
+    userId: string,
+    role: "admin" | "user",
+    principal: Principal = defaultPrincipal(),
+  ): Promise<User> {
+    if (principal.role !== "admin") {
+      throw new HttpError(403, "Only admins may add users");
+    }
+    if (this.mockResourceService.resolveUser(userId)) {
+      throw new HttpError(409, `User ${userId} already exists`);
+    }
+    const user = await this.mockResourceService.addUser(userId, role);
+    await this.audit(principal, null, "add-user", `user:${userId}`, "allow", `admin; role ${role}`);
+    return user;
   }
 
   async systemInfo(): Promise<Record<string, unknown>> {

@@ -47,7 +47,7 @@ describe("boundary 3 — relay policy", () => {
   it("allows a scoped read, returns the redacted view, and audits allow", async () => {
     const { service, store } = await makeService();
     const { token } = await service.mintCredential("agent-1", "run-1", "alice", [
-      "read:secrets:alice",
+      "read:secrets:alice/db-url",
     ]);
 
     const result = await service.relay("GET", "secrets/alice/db-url", undefined, token);
@@ -136,7 +136,7 @@ describe("boundary 3 — HTTP routes", () => {
   it("routes /mock/proxy/* through the relay with the proxy-injected token", async () => {
     const { service } = await makeService();
     const { token } = await service.mintCredential("agent-1", "run-1", "alice", [
-      "read:secrets:alice",
+      "read:secrets:alice/db-url",
     ]);
     const app = await createMockApp(service);
     try {
@@ -277,43 +277,62 @@ describe("boundary 3 — HTTP routes", () => {
     expect(decision.allowed).toBe(false);
   });
 
-  it("does not allow a dev deployment capability to deploy to prod", async() => { 
-    const { service } = await makeService(); 
-    const context: AuthorizationContext = { 
-      agentId: "agent-1", 
-      runId: "run-1", 
-      ownerId: "alice", 
-      capabilities: [ 
-        { action: "act", resource: "deploy", scope: "dev", }, 
-      ], 
-      expiresAt: new Date(Date.now() + 60_000).toISOString(), 
-    }; 
-    const decision = service.authorize(context, 
-      { action: "act", resource: "deploy", scope: "prod", }
-    ); 
-    expect(decision.allowed).toBe(false); 
-  }); 
-  
-  it("evaluates capabilities independently", async() => { 
-    const { service } = await makeService();  
+  it("does not allow a dev deployment capability to deploy to prod", async() => {
+    const { service } = await makeService();
     const context: AuthorizationContext = {
-      agentId: "agent-1", 
-      runId: "run-1", 
-      ownerId: "alice", 
-      capabilities: [ 
+      agentId: "agent-1",
+      runId: "run-1",
+      ownerId: "alice",
+      capabilities: [
+        { action: "act", resource: "deploy", scope: "dev", },
+      ],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    const decision = service.authorize(context,
+      { action: "act", resource: "deploy", scope: "prod", }
+    );
+    expect(decision.allowed).toBe(false);
+  });
+
+  it("evaluates capabilities independently", async() => {
+    const { service } = await makeService();
+    const context: AuthorizationContext = {
+      agentId: "agent-1",
+      runId: "run-1",
+      ownerId: "alice",
+      capabilities: [
         { action: "read", resource: "secrets", scope: "alice", },
-        { action: "act", resource: "deploy", scope: "dev", }, 
-      ], 
-      expiresAt: new Date(Date.now() + 60_000).toISOString(), 
-    }; 
-    expect( service.authorize(context, 
-      { action: "read", resource: "secrets", scope: "alice", }).allowed, 
-    ).toBe(true); 
-    expect( service.authorize(context, 
-      { action: "act", resource: "deploy", scope: "prod", }).allowed, 
-    ).toBe(false); 
-    expect( service.authorize(context, 
+        { action: "act", resource: "deploy", scope: "dev", },
+      ],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    expect( service.authorize(context,
+      { action: "read", resource: "secrets", scope: "alice", }).allowed,
+    ).toBe(true);
+    expect( service.authorize(context,
+      { action: "act", resource: "deploy", scope: "prod", }).allowed,
+    ).toBe(false);
+    expect( service.authorize(context,
       { action: "write", resource: "secrets", scope: "alice", }).allowed,
      ).toBe(false); });
+
+  it("admin role bypasses the per-key capability check (cross-owner allow)", async () => {
+    const { service } = await makeService();
+    const adminContext = {
+      agentId: "agent-admin",
+      runId: "run-admin",
+      ownerId: "admin",
+      isAdmin: true,
+      capabilities: [],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    expect(
+      service.authorize(adminContext, {
+        action: "read",
+        resource: "secrets",
+        scope: "alice/db-url",
+      }).allowed,
+    ).toBe(true);
+  });
 
 });

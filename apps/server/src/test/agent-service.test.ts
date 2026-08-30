@@ -38,7 +38,10 @@ afterEach(async () => {
   );
 });
 
-async function makeService(runner: AgentRunner = new FakeRunner()): Promise<AgentService> {
+async function makeService(
+  runner: AgentRunner = new FakeRunner(),
+  opts: { arklessPlanner?: boolean } = {},
+): Promise<AgentService> {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
   temporaryDirectories.push(root);
   const config = loadConfig({
@@ -51,7 +54,13 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
   });
   const store = new JsonStore(path.join(root, "data", "db.json"));
   const mockResourceService = new MockResourceService(config, store);
-  const intentPlanner = new IntentPlanner(config);
+  // The fallback-planner test must NOT take the live LLM path (it would fetch
+  // Ark with bogus creds and hang past the test timeout on networked hosts).
+  // An arkless planner config forces plan() onto the deterministic fallback.
+  const plannerConfig = opts.arklessPlanner
+    ? { ...config, arkApiKey: "", arkModel: "" }
+    : config;
+  const intentPlanner = new IntentPlanner(plannerConfig);
   const service = new AgentService(
     config,
     store,
@@ -214,14 +223,14 @@ describe("Bouncer ownership boundary (boundary 2)", () => {
   });
 
   it("plans intent-bound scopes from a stated intent (fallback planner)", async () => {
-    const service = await makeService();
+    const service = await makeService(new FakeRunner(), { arklessPlanner: true });
     const alice = principal("alice");
     const plan = await service.planIntent(
       "build a todo app that reads my DB url and deploys to dev",
       alice,
     );
     expect(plan.source).toBe("fallback");
-    expect(plan.baselineScopes).toContain("read:secrets:alice");
+    expect(plan.baselineScopes).toContain("read:secrets:alice/db-url");
     expect(plan.baselineScopes).toContain("act:deploy:dev");
     expect(plan.elevatedScopes).toEqual([]);
     expect(service.listAudit().some((row) => row.action === "plan")).toBe(true);

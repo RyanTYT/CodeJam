@@ -1,4 +1,4 @@
-import type { Agent, AgentRun, Audit, IntentPlan, Message, SystemInfo } from "./types";
+import type { Agent, AgentRun, Audit, IntentPlan, Message, Secret, SystemInfo, User } from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -59,6 +59,24 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ scope }),
     }),
+  listSecrets: () => request<{ secrets: Secret[] }>("/api/secrets"),
+  addSecret: (owner: string, key: string, value: string, redactedView: string | undefined) =>
+    request<{ secret: Secret }>("/api/secrets", {
+      method: "POST",
+      body: JSON.stringify({ owner, key, value, redactedView }),
+    }),
+  revokeSecret: (owner: string, key: string) =>
+    request<{ deleted: boolean }>("/api/secrets/revoke", {
+      method: "POST",
+      body: JSON.stringify({ owner, key }),
+    }),
+  listUsers: () => request<{ users: User[] }>("/api/users"),
+  addUser: (userId: string, role: "admin" | "user") =>
+    request<{ user: User }>("/api/users", {
+      method: "POST",
+      body: JSON.stringify({ userId, role }),
+    }),
+  me: () => request<{ user: { userId: string; role: "admin" | "user" } }>("/api/me"),
   planAgent: (intent: string) =>
     request<{ plan: IntentPlan }>("/api/agents/plan", {
       method: "POST",

@@ -4,43 +4,47 @@ import type { IntentPlan, ScopeRisk } from "./types.js";
 
 export type { ScopeRisk };
 
-interface ScopeRule {
-  pattern: string; // e.g. "read:secrets:{owner}"
-  risk: "baseline" | "elevated";
-  description: string;
-}
-
-/** The catalogue of scopes the planner may propose, with their risk classification. */
-const TAXONOMY: readonly ScopeRule[] = [
-  { pattern: "read:secrets:{owner}", risk: "baseline", description: "read your own mock secrets" },
-  { pattern: "write:secrets:{owner}", risk: "elevated", description: "write your own mock secrets" },
-  { pattern: "act:deploy:dev", risk: "baseline", description: "deploy to the dev environment" },
-  { pattern: "act:deploy:prod", risk: "elevated", description: "deploy to prod" },
-];
-
 export interface TaxonomyEntry {
   scope: string;
   risk: "baseline" | "elevated";
   description: string;
 }
 
-/** The taxonomy with `{owner}` substituted for a concrete owner. */
-export function taxonomyFor(ownerId: string): TaxonomyEntry[] {
-  return TAXONOMY.map((rule) => ({
-    scope: rule.pattern.replace("{owner}", ownerId),
-    risk: rule.risk,
-    description: rule.description,
-  }));
+/**
+ * The per-key taxonomy for an owner: for each of their secrets, a baseline
+ * `read:` and an elevated `write:`; plus the deploy scopes. Dynamic because it
+ * depends on the owner's actual vault contents.
+ */
+export function taxonomyFor(
+  ownerId: string,
+  secretKeys: readonly string[] = [],
+): TaxonomyEntry[] {
+  const entries: TaxonomyEntry[] = [];
+  for (const key of secretKeys) {
+    entries.push({
+      scope: `read:secrets:${ownerId}/${key}`,
+      risk: "baseline",
+      description: `read your secret "${key}"`,
+    });
+    entries.push({
+      scope: `write:secrets:${ownerId}/${key}`,
+      risk: "elevated",
+      description: `write your secret "${key}"`,
+    });
+  }
+  entries.push({ scope: "act:deploy:dev", risk: "baseline", description: "deploy to the dev environment" });
+  entries.push({ scope: "act:deploy:prod", risk: "elevated", description: "deploy to prod" });
+  return entries;
 }
 
 /**
  * Classify a concrete scope for a given owner.
- * - `read:secrets:<owner>` is baseline; `read:secrets:<other>` is elevated (cross-user).
+ * - `read:secrets:<owner>[/<key>]` is baseline if own, elevated if cross-user.
  * - any `write:secrets:*` is elevated; `act:deploy:dev` baseline; `act:deploy:prod` elevated.
  * - anything else is unknown (rejected, never granted).
  */
 export function classifyScope(scope: string, ownerId: string): ScopeRisk {
-  const secretsRead = scope.match(/^read:secrets:(.+)$/);
+  const secretsRead = scope.match(/^read:secrets:([^/]+)(?:\/(.+))?$/);
   if (secretsRead) return secretsRead[1] === ownerId ? "baseline" : "elevated";
   if (/^write:secrets:/.test(scope)) return "elevated";
   if (scope === "act:deploy:dev") return "baseline";
@@ -56,30 +60,39 @@ interface ProposedPlan {
 }
 
 /**
- * Intent-bound permissions planner. Given a free-text intent, proposes the
- * MINIMUM scopes an agent needs. Calls the configured Ark model; on any failure
- * (model not configured, 404, timeout, unparseable output) falls back to a
- * deterministic keyword→scope planner so the feature is always demo-able.
- * Every proposed scope is then classified — baseline auto-grants, elevated need
- * approval, unknown is rejected — so the LLM cannot grant a scope the taxonomy
- * doesn't know.
+ * Intent-bound permissions planner. Given a free-text intent + the owner's
+ * secret keys, proposes the MINIMUM per-key scopes an agent needs. Calls the
+ * configured Ark model; on any failure falls back to a deterministic
+ * keyword→per-key-scope planner. Every proposed scope is then classified —
+ * baseline auto-grants, elevated need approval, unknown is rejected — so the
+ * LLM cannot grant a scope the taxonomy doesn't know.
  */
 export class IntentPlanner {
   constructor(private readonly config: AppConfig) {}
 
-  async plan(intent: string, ownerId: string): Promise<IntentPlan> {
+  async plan(
+    intent: string,
+    ownerId: string,
+    secretKeys: readonly string[] = [],
+  ): Promise<IntentPlan> {
     let proposed: ProposedPlan;
     if (isArkConfigured(this.config)) {
-      proposed = await this.planWithLlm(intent, ownerId).catch(() => this.planFallback(intent, ownerId));
-      if (proposed.scopes.length === 0) proposed = this.planFallback(intent, ownerId);
+      proposed = await this.planWithLlm(intent, ownerId, secretKeys).catch(() =>
+        this.planFallback(intent, ownerId, secretKeys),
+      );
+      if (proposed.scopes.length === 0) proposed = this.planFallback(intent, ownerId, secretKeys);
     } else {
-      proposed = this.planFallback(intent, ownerId);
+      proposed = this.planFallback(intent, ownerId, secretKeys);
     }
     return this.classify(intent, ownerId, proposed);
   }
 
-  private async planWithLlm(intent: string, ownerId: string): Promise<ProposedPlan> {
-    const taxonomy = taxonomyFor(ownerId)
+  private async planWithLlm(
+    intent: string,
+    ownerId: string,
+    secretKeys: readonly string[],
+  ): Promise<ProposedPlan> {
+    const taxonomy = taxonomyFor(ownerId, secretKeys)
       .map((entry) => `- ${entry.scope} (${entry.risk}): ${entry.description}`)
       .join("\n");
     const prompt = [
@@ -111,33 +124,43 @@ export class IntentPlanner {
       const text = extractOutputText(data);
       const parsed = parseScopesJson(text);
       if (parsed.scopes.length === 0) throw new Error("model returned no parseable scopes");
-      return {
-        scopes: parsed.scopes,
-        justification: parsed.justification,
-        source: "llm",
-      };
+      return { scopes: parsed.scopes, justification: parsed.justification, source: "llm" };
     } finally {
       clearTimeout(timeout);
     }
   }
 
-  private planFallback(intent: string, ownerId: string): ProposedPlan {
+  /** Deterministic per-key fallback: match the intent's keywords to the owner's secrets. */
+  private planFallback(
+    intent: string,
+    ownerId: string,
+    secretKeys: readonly string[],
+  ): ProposedPlan {
     const lower = intent.toLowerCase();
     const scopes = new Set<string>();
-    if (/\b(read|fetch|get|db|database|secret|url|connection|retrieve)/.test(lower)) {
-      scopes.add(`read:secrets:${ownerId}`);
+    const wantsRead = /\b(read|fetch|get|db|database|secret|url|connection|retrieve)/.test(lower);
+    const wantsWrite = /\b(write|update|create|migrate|insert|seed|modify)/.test(lower);
+    for (const key of secretKeys) {
+      const klower = key.toLowerCase();
+      const parts = klower.split(/[^a-z0-9]+/).filter((part) => part.length >= 2);
+      const mentioned = lower.includes(klower) || parts.some((part) => lower.includes(part));
+      if (mentioned && wantsRead) scopes.add(`read:secrets:${ownerId}/${key}`);
+      if (mentioned && wantsWrite) scopes.add(`write:secrets:${ownerId}/${key}`);
     }
-    if (/\b(write|update|create|migrate|insert|seed|modify)/.test(lower)) {
-      scopes.add(`write:secrets:${ownerId}`);
+    // No specific secret matched but the intent is about reading → grant the first one.
+    const firstKey = secretKeys[0];
+    if (scopes.size === 0 && firstKey && wantsRead) {
+      scopes.add(`read:secrets:${ownerId}/${firstKey}`);
     }
     if (/\b(deploy|ship|release)/.test(lower)) {
       scopes.add(/\b(prod|production)/.test(lower) ? "act:deploy:prod" : "act:deploy:dev");
     }
+    // Legacy owner-scoped default so agents keep working without any vault secrets.
     if (scopes.size === 0) scopes.add(`read:secrets:${ownerId}`);
     return {
       scopes: [...scopes],
       justification:
-        "Fallback planner: derived the minimum scopes from keywords in the intent (the model was unavailable or its output was unparseable).",
+        "Fallback planner: derived the minimum per-key scopes from keywords in the intent (the model was unavailable or its output was unparseable).",
       source: "fallback",
     };
   }

@@ -13,6 +13,7 @@ const emptyDatabase = (): Database => ({
   mockResources: [],
   deployStates: [],
   audit: [],
+  users: [],
 });
 
 /**
@@ -37,10 +38,32 @@ function migrate(parsed: Partial<Database>): Database {
   }
   const agents = parsed.agents.map((agent) => {
     const ownerId = agent.ownerId ?? "default";
+    const baseScopes = agent.scopes ?? [`read:secrets:${ownerId}`, "act:deploy:dev"];
+    // Expand legacy owner-scoped scopes (read:secrets:alice) into per-key
+    // scopes (read:secrets:alice/<key>) for each of that owner's secrets, so
+    // the per-key permission map + revoke operate on real granted scopes.
+    const expanded: string[] = [];
+    for (const scope of baseScopes) {
+      const match = scope.match(/^(read|write):secrets:([^/]+)$/);
+      const verb = match?.[1];
+      const scopeOwner = match?.[2];
+      if (verb && scopeOwner) {
+        const keys = (parsed.mockResources ?? [])
+          .filter((resource) => resource.owner === scopeOwner)
+          .map((resource) => resource.key);
+        if (keys.length > 0) {
+          for (const key of keys) {
+            expanded.push(`${verb}:secrets:${scopeOwner}/${key}`);
+          }
+          continue;
+        }
+      }
+      expanded.push(scope);
+    }
     return {
       ...agent,
       ownerId,
-      scopes: agent.scopes ?? [`read:secrets:${ownerId}`, "act:deploy:dev"],
+      scopes: [...new Set(expanded)],
       plan: agent.plan ?? null,
     };
   });
@@ -54,6 +77,7 @@ function migrate(parsed: Partial<Database>): Database {
       mockResources: parsed.mockResources ?? [],
       deployStates: parsed.deployStates ?? [],
       audit: parsed.audit ?? [],
+      users: parsed.users ?? [],
     };
   }
   return {
@@ -65,6 +89,7 @@ function migrate(parsed: Partial<Database>): Database {
     mockResources: [],
     deployStates: [],
     audit: [],
+    users: [],
   };
 }
 

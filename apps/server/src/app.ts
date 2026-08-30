@@ -41,6 +41,30 @@ const planAgentBody = z.object({
 const revokeScopeBody = z.object({
   scope: z.string().trim().min(1).max(200),
 });
+const secretBody = z.object({
+  owner: z
+    .string()
+    .trim()
+    .min(1)
+    .max(60)
+    .regex(/^[a-zA-Z0-9_-]+$/, "owner must be URL-safe"),
+  key: z.string().trim().min(1).max(120),
+  value: z.string().min(1).max(10_000),
+  redactedView: z.string().max(200).optional(),
+});
+const revokeSecretBody = z.object({
+  owner: z.string().trim().min(1).max(60),
+  key: z.string().trim().min(1).max(120),
+});
+const userBody = z.object({
+  userId: z
+    .string()
+    .trim()
+    .min(1)
+    .max(60)
+    .regex(/^[a-zA-Z0-9_-]+$/, "userId must be URL-safe"),
+  role: z.enum(["admin", "user"]).default("user"),
+});
 const updateAgentBody = createAgentBody.partial().refine(
   (value) => Object.keys(value).length > 0,
   "At least one field is required",
@@ -84,14 +108,11 @@ export async function createApp(
       const raw = Array.isArray(header) ? header[0] : header;
       const userId =
         typeof raw === "string" && raw.trim().length > 0 ? raw.trim() : "default";
-      request.principal = {
-        kind: "human",
-        id: "user:" + userId,
-        userId,
-        runId: undefined,
-        scopes: [],
-        expiresAt: undefined,
-      };
+      const principal = service.resolvePrincipal(userId);
+      if (!principal) {
+        return reply.code(401).send({ error: "unknown user" });
+      }
+      request.principal = principal;
     }
 
     // Shared operator bearer token (NOT identity). Kept separate from the
@@ -203,6 +224,43 @@ export async function createApp(
   app.get("/api/audit", async (request) => {
     const query = auditQuery.parse(request.query);
     return { audit: service.listAudit(query.agentId, request.principal) };
+  });
+
+  app.get("/api/secrets", async (request) => {
+    return { secrets: service.listSecrets(request.principal) };
+  });
+
+  app.post("/api/secrets", async (request, reply) => {
+    const body = secretBody.parse(request.body);
+    const secret = await service.addSecret(
+      body.owner,
+      body.key,
+      body.value,
+      body.redactedView,
+      request.principal,
+    );
+    return reply.code(201).send({ secret });
+  });
+
+  app.post("/api/secrets/revoke", async (request) => {
+    const body = revokeSecretBody.parse(request.body);
+    return service.deleteSecret(body.owner, body.key, request.principal);
+  });
+
+  app.get("/api/me", async (request) => {
+    return {
+      user: { userId: request.principal.userId, role: request.principal.role },
+    };
+  });
+
+  app.get("/api/users", async () => {
+    return { users: service.listUsers() };
+  });
+
+  app.post("/api/users", async (request, reply) => {
+    const body = userBody.parse(request.body);
+    const user = await service.addUser(body.userId, body.role, request.principal);
+    return reply.code(201).send({ user });
   });
 
   if (config.nodeEnv === "production") {

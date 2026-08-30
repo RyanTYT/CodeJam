@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken, setMockUser } from "./api";
-import type { Agent, AgentRun, Audit, IntentPlan, Message, SystemInfo } from "./types";
+import type { Agent, AgentRun, Audit, IntentPlan, Message, Secret, SystemInfo, User } from "./types";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -15,6 +15,9 @@ const emptyForm = {
     "Help me build and test software in this workspace. Keep changes small and explain the result.",
 };
 
+const POLICY_TABS = ["permissions", "vault", "decisions", "owner"] as const;
+type PolicyTab = (typeof POLICY_TABS)[number];
+
 function formatTime(value: string): string {
   return new Intl.DateTimeFormat(undefined, {
     hour: "2-digit",
@@ -22,16 +25,38 @@ function formatTime(value: string): string {
   }).format(new Date(value));
 }
 
+/**
+ * Client-side mirror of the server's scope taxonomy. Per-key aware:
+ * `read:secrets:<owner>/<key>` is baseline when <owner> === the agent's owner,
+ * elevated (cross-user) otherwise. Writes are always elevated. The deploy
+ * split keeps dev baseline, prod elevated.
+ */
 function classifyScopeClient(
   scope: string,
   ownerId: string | undefined,
 ): "baseline" | "elevated" | "unknown" {
-  const m = scope.match(/^read:secrets:(.+)$/);
-  if (m && m[1]) return m[1] === ownerId ? "baseline" : "elevated";
+  const readMatch = scope.match(/^read:secrets:(.+)$/);
+  if (readMatch && readMatch[1]) {
+    const targetOwner = readMatch[1].split("/")[0];
+    return targetOwner === ownerId ? "baseline" : "elevated";
+  }
   if (/^write:secrets:/.test(scope)) return "elevated";
   if (scope === "act:deploy:dev") return "baseline";
   if (scope === "act:deploy:prod") return "elevated";
   return "unknown";
+}
+
+/**
+ * Mirror of the relay's capability check: a granted scope `granted` covers a
+ * cell scope `cell` when they are equal, OR `cell` starts with `granted + "/"`
+ * (so an owner-scoped grant covers every per-key cell under that owner).
+ */
+function scopeCovers(granted: string, cell: string): boolean {
+  return cell === granted || cell.startsWith(granted + "/");
+}
+
+function isGranted(scopes: string[], cell: string): boolean {
+  return scopes.some((granted) => scopeCovers(granted, cell));
 }
 
 function StatusPill({ status }: { status: Agent["status"] }) {
@@ -68,15 +93,42 @@ export default function App() {
   const [approvedElevated, setApprovedElevated] = useState<Set<string>>(new Set());
   const [auditFilter, setAuditFilter] = useState<"all" | "allow" | "deny">("all");
   const [expandedAuditId, setExpandedAuditId] = useState<string | null>(null);
+  const [policyTab, setPolicyTab] = useState<PolicyTab>("permissions");
+  const [secrets, setSecrets] = useState<Secret[]>([]);
+  const [selectedForRevoke, setSelectedForRevoke] = useState<Set<string>>(new Set());
+  const [vaultForm, setVaultForm] = useState({
+    owner: "",
+    key: "",
+    value: "",
+    redactedView: "",
+  });
+  const [showVaultForm, setShowVaultForm] = useState(false);
+  const [users, setUsers] = useState<User[]>([]);
+  const [showAddUser, setShowAddUser] = useState(false);
+  const [newUserForm, setNewUserForm] = useState<{ userId: string; role: "user" | "admin" }>({
+    userId: "",
+    role: "user",
+  });
   const messageEnd = useRef<HTMLDivElement>(null);
   const selectedIdRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
   const pollingRunIds = useRef(new Set<string>());
   selectedIdRef.current = selectedId;
+  const currentRole: "admin" | "user" =
+    users.find((u) => u.userId === currentUser)?.role ?? "user";
 
   const selected = useMemo(
     () => agents.find((agent) => agent.id === selectedId) ?? null,
     [agents, selectedId],
+  );
+
+  const ownerRole: "admin" | "user" = selected
+    ? (users.find((u) => u.userId === selected.ownerId)?.role ?? "user")
+    : "user";
+
+  const vaultSecrets = useMemo(
+    () => (selected ? secrets.filter((s) => s.owner === selected.ownerId) : []),
+    [secrets, selected],
   );
 
   const refreshAgents = useCallback(async () => {
@@ -96,9 +148,24 @@ export default function App() {
     }
   }, []);
 
+  const refreshSecrets = useCallback(async () => {
+    const { secrets: next } = await api.listSecrets();
+    if (mountedRef.current) setSecrets(next);
+  }, []);
+
+  const refreshUsers = useCallback(async () => {
+    const { users: next } = await api.listUsers();
+    if (mountedRef.current) setUsers(next);
+  }, []);
+
   const bootstrap = useCallback(async () => {
-    await Promise.all([refreshAgents(), api.system().then(setSystem)]);
-  }, [refreshAgents]);
+    await Promise.all([
+      refreshAgents(),
+      api.system().then(setSystem),
+      refreshUsers(),
+      refreshSecrets(),
+    ]);
+  }, [refreshAgents, refreshUsers, refreshSecrets]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -117,20 +184,27 @@ export default function App() {
 
   useEffect(() => {
     setMockUser(currentUser);
-    void refreshAgents().catch((reason) =>
+    void Promise.all([refreshAgents(), refreshUsers(), refreshSecrets()]).catch((reason) =>
       setError(reason instanceof Error ? reason.message : String(reason)),
     );
-  }, [currentUser, refreshAgents]);
+  }, [currentUser, refreshAgents, refreshUsers, refreshSecrets]);
 
   useEffect(() => {
     setActiveRun(null);
     setShowSettings(false);
+    setShowVaultForm(false);
     setAudit([]);
+    setSelectedForRevoke(new Set());
     if (!selectedId) {
       setMessages([]);
       return;
     }
-    void Promise.all([refreshMessages(selectedId), api.runs(selectedId), api.audit(selectedId)])
+    void Promise.all([
+      refreshMessages(selectedId),
+      api.runs(selectedId),
+      api.audit(selectedId),
+      refreshSecrets(),
+    ])
       .then(([, runsResult, auditResult]) => {
         if (selectedIdRef.current !== selectedId) return;
         setAudit(auditResult.audit);
@@ -145,7 +219,7 @@ export default function App() {
       .catch((reason) =>
         setError(reason instanceof Error ? reason.message : String(reason)),
       );
-  }, [refreshMessages, selectedId]);
+  }, [refreshMessages, selectedId, refreshSecrets]);
 
   useEffect(() => {
     if (selected) {
@@ -315,6 +389,102 @@ export default function App() {
     }
   };
 
+  const toggleRevokeSelect = (scope: string) => {
+    setSelectedForRevoke((prev) => {
+      const next = new Set(prev);
+      if (next.has(scope)) next.delete(scope);
+      else next.add(scope);
+      return next;
+    });
+  };
+
+  const revokeSelected = async () => {
+    if (!selected || selectedForRevoke.size === 0) return;
+    setBusy(true);
+    setError(null);
+    try {
+      for (const scope of selectedForRevoke) {
+        await api.removeScope(selected.id, scope);
+      }
+      await refreshAgents();
+      const result = await api.audit(selected.id);
+      if (selectedIdRef.current === selected.id) setAudit(result.audit);
+      setSelectedForRevoke(new Set());
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const addSecret = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!selected) return;
+    if (currentRole !== "admin") {
+      setError("Only admins may manage secrets.");
+      return;
+    }
+    const { owner, key, value, redactedView } = vaultForm;
+    if (!owner.trim() || !key.trim() || !value) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.addSecret(owner.trim(), key.trim(), value, redactedView.trim() || undefined);
+      await refreshSecrets();
+      setVaultForm({ owner: "", key: "", value: "", redactedView: "" });
+      setShowVaultForm(false);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const revokeSecret = async (owner: string, key: string) => {
+    if (currentRole !== "admin") {
+      setError("Only admins may manage secrets.");
+      return;
+    }
+    if (!window.confirm("Revoke secret " + owner + "/" + key + "?")) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.revokeSecret(owner, key);
+      await refreshSecrets();
+      if (selected) {
+        const result = await api.audit(selected.id);
+        if (selectedIdRef.current === selected.id) setAudit(result.audit);
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const addUser = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (currentRole !== "admin") {
+      setError("Only admins may add users.");
+      return;
+    }
+    if (!newUserForm.userId.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const userId = newUserForm.userId.trim();
+      await api.addUser(userId, newUserForm.role);
+      await refreshUsers();
+      setCurrentUser(userId);
+      setShowAddUser(false);
+      setNewUserForm({ userId: "", role: "user" });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const pollRun = async (runId: string, agentId: string) => {
     if (pollingRunIds.current.has(runId)) return;
     pollingRunIds.current.add(runId);
@@ -383,6 +553,46 @@ export default function App() {
     }
   };
 
+  /** A single permission-map cell: risk dot + verb label + (if granted) a
+   *  bulk-revoke checkbox and a single-scope revoke ×. Greyed when un-granted. */
+  const renderPermCell = (scope: string, label: string) => {
+    if (!selected) return null;
+    const granted = isGranted(selected.scopes ?? [], scope);
+    const risk = classifyScopeClient(scope, selected.ownerId);
+    const checked = selectedForRevoke.has(scope);
+    return (
+      <div key={scope} className={"perm-cell" + (granted ? " perm-granted" : "")}>
+        <span
+          className={"mini-dot mini-" + (risk === "baseline" ? "ready" : risk === "elevated" ? "warning" : "error")}
+        />
+        <code>{label}</code>
+        {granted ? (
+          <label className="perm-check">
+            <input
+              type="checkbox"
+              checked={checked}
+              onChange={() => toggleRevokeSelect(scope)}
+              disabled={busy}
+              title="Select for bulk revoke"
+            />
+          </label>
+        ) : (
+          <span className="perm-dash">—</span>
+        )}
+        {granted && (
+          <button
+            className="perm-x"
+            onClick={() => revokeScope(scope)}
+            disabled={busy}
+            title="Revoke this scope"
+          >
+            ×
+          </button>
+        )}
+      </div>
+    );
+  };
+
   if (authRequired === null) {
     return (
       <main className="auth-screen">
@@ -424,6 +634,8 @@ export default function App() {
     );
   }
 
+  const switcherUsers = users.length > 0 ? users.map((u) => u.userId) : ["default"];
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -440,15 +652,18 @@ export default function App() {
         </div>
 
         <div className="user-switcher">
-          <span className="eyebrow">Mock user</span>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <span className="eyebrow">Mock user</span>
+            <span className="eyebrow" style={{ color: currentRole === "admin" ? "#b9a4ff" : undefined }}>
+              {currentRole}
+            </span>
+          </div>
           <div className="segmented">
-            {(["default", "alice", "bob"] as const).map((user) => (
+            {switcherUsers.map((user) => (
               <button
                 key={user}
                 type="button"
-                className={
-                  "segment" + (currentUser === user ? " segment-active" : "")
-                }
+                className={"segment" + (currentUser === user ? " segment-active" : "")}
                 onClick={() => {
                   setCurrentUser(user);
                   setSelectedId(null);
@@ -458,6 +673,27 @@ export default function App() {
               </button>
             ))}
           </div>
+          {currentRole === "admin" && (
+            <button
+              style={{
+                width: "100%",
+                minHeight: 32,
+                fontSize: 11,
+                border: "1px solid #3d3d38",
+                background: "#292925",
+                color: "#c9c8c1",
+                borderRadius: 9,
+                cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 6,
+              }}
+              onClick={() => setShowAddUser(true)}
+            >
+              <span>＋</span> Add user
+            </button>
+          )}
         </div>
 
         <button
@@ -708,7 +944,7 @@ export default function App() {
                   disabled={
                     selected.status === "stopped" ||
                     selected.status === "busy" ||
-                    activeRun != null && ["queued", "running"].includes(activeRun.status)
+                    (activeRun != null && ["queued", "running"].includes(activeRun.status))
                   }
                   rows={3}
                 />
@@ -757,210 +993,374 @@ export default function App() {
       <aside className="policy-console">
         {selected ? (
           <>
-            {/* Permissions card */}
-            <div style={{ marginBottom: 16 }}>
-              <div className="playground-topbar" style={{ marginBottom: 8 }}>
-                <div>
-                  <span className="eyebrow">Permissions</span>
+            <div className="policy-tabs">
+              {POLICY_TABS.map((tab) => (
+                <button
+                  key={tab}
+                  type="button"
+                  className={"policy-tab" + (policyTab === tab ? " policy-tab-active" : "")}
+                  onClick={() => setPolicyTab(tab)}
+                >
+                  {tab}
+                </button>
+              ))}
+            </div>
+
+            {policyTab === "permissions" && (
+              <div className="policy-section">
+                <div className="playground-topbar" style={{ marginBottom: 4 }}>
+                  <div>
+                    <span className="eyebrow">Permissions</span>
+                    {selected.plan && (
+                      <span style={{ fontSize: 11, opacity: 0.6, marginLeft: 6 }}>
+                        plan: {selected.plan.source}
+                      </span>
+                    )}
+                  </div>
+                  <button
+                    className="button button-danger"
+                    style={{ minHeight: 30, fontSize: 11, padding: "0 10px" }}
+                    disabled={busy || selectedForRevoke.size === 0}
+                    onClick={revokeSelected}
+                  >
+                    Revoke selected ({selectedForRevoke.size})
+                  </button>
                 </div>
-                {selected.plan && (
-                  <span style={{ fontSize: 11, opacity: 0.6 }}>plan: {selected.plan.source}</span>
+
+                {ownerRole === "admin" && (
+                  <div className="perm-bypass">
+                    Owner is an admin — the relay grants all requests (capability check bypassed).
+                  </div>
                 )}
-              </div>
-              {selected.plan?.intent && (
-                <p style={{ fontSize: 12, opacity: 0.7, margin: "0 0 8px" }}>
-                  Intent: {selected.plan.intent}
-                </p>
-              )}
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                {selected.scopes?.map((scope) => {
-                  const risk = classifyScopeClient(scope, selected.ownerId);
-                  const bg =
-                    risk === "baseline"
-                      ? "rgba(80,220,120,.08)"
-                      : risk === "elevated"
-                        ? "rgba(255,180,80,.1)"
-                        : "rgba(255,80,80,.08)";
-                  return (
-                    <div
-                      key={scope}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 6,
-                        padding: "4px 8px",
-                        borderRadius: 8,
-                        background: bg,
-                        fontSize: 12,
-                      }}
-                    >
-                      <span
-                        className={"mini-dot mini-" + (risk === "baseline" ? "ready" : "error")}
-                      />
-                      <code
-                        style={{
-                          fontSize: 11,
-                          flex: 1,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        {scope}
-                      </code>
-                      <button
-                        onClick={() => revokeScope(scope)}
-                        disabled={busy}
-                        title="Revoke this scope"
-                        style={{
-                          background: "none",
-                          border: "none",
-                          color: "rgba(255,255,255,.4)",
-                          cursor: "pointer",
-                          fontSize: 14,
-                          padding: 0,
-                        }}
-                      >
-                        ×
-                      </button>
+
+                {selected.plan?.intent && (
+                  <p className="perm-intent">Intent: {selected.plan.intent}</p>
+                )}
+
+                <div className="perm-map">
+                  <div className="perm-row perm-row-head">
+                    <span />
+                    <span>read</span>
+                    <span>write</span>
+                  </div>
+                  {vaultSecrets.map((s) => {
+                    const readScope = "read:secrets:" + s.owner + "/" + s.key;
+                    const writeScope = "write:secrets:" + s.owner + "/" + s.key;
+                    return (
+                      <div className="perm-row" key={s.owner + "/" + s.key}>
+                        <div className="perm-label" title={readScope}>
+                          {s.owner}/{s.key}
+                        </div>
+                        {renderPermCell(readScope, "read")}
+                        {renderPermCell(writeScope, "write")}
+                      </div>
+                    );
+                  })}
+                  <div className="perm-row">
+                    <div className="perm-label">deploy</div>
+                    {renderPermCell("act:deploy:dev", "dev")}
+                    {renderPermCell("act:deploy:prod", "prod")}
+                  </div>
+                  {vaultSecrets.length === 0 && (
+                    <div className="perm-empty">
+                      No secrets registered for {selected.ownerId}.
                     </div>
-                  );
-                })}
-              </div>
-              {selected.plan && (
-                <details style={{ marginTop: 8 }}>
-                  <summary style={{ fontSize: 12, opacity: 0.7, cursor: "pointer" }}>
-                    View plan
-                  </summary>
-                  <div style={{ fontSize: 11, opacity: 0.8, marginTop: 4 }}>
-                    <p style={{ margin: "0 0 4px" }}>{selected.plan.justification}</p>
-                    <p style={{ margin: "0 0 2px" }}>
-                      requested: {selected.plan.requestedScopes.join(", ") || "—"}
-                    </p>
-                    <p style={{ margin: "0 0 2px" }}>
-                      baseline: {selected.plan.baselineScopes.join(", ") || "—"}
-                    </p>
-                    <p style={{ margin: "0 0 2px" }}>
-                      elevated: {selected.plan.elevatedScopes.join(", ") || "—"}
-                    </p>
-                    <p style={{ margin: 0 }}>
-                      unknown: {selected.plan.unknownScopes.join(", ") || "—"}
-                    </p>
+                  )}
+                </div>
+
+                {selected.plan && (
+                  <details className="perm-plan" style={{ marginTop: 4 }}>
+                    <summary>View plan</summary>
+                    <div className="perm-plan-body">
+                      <p>{selected.plan.justification}</p>
+                      <p>requested: {selected.plan.requestedScopes.join(", ") || "—"}</p>
+                      <p>baseline: {selected.plan.baselineScopes.join(", ") || "—"}</p>
+                      <p>elevated: {selected.plan.elevatedScopes.join(", ") || "—"}</p>
+                      <p>unknown: {selected.plan.unknownScopes.join(", ") || "—"}</p>
+                    </div>
+                  </details>
+                )}
+
+                <details style={{ marginTop: 4 }}>
+                  <summary className="perm-ref-summary">Policy reference</summary>
+                  <div className="perm-ref">
+                    <p>🟢 baseline: read:secrets:&lt;own&gt;, act:deploy:dev</p>
+                    <p>🟠 elevated: write:*, read cross-user, act:deploy:prod</p>
+                    <p>🔴 unknown: rejected</p>
                   </div>
                 </details>
-              )}
-            </div>
-
-            {/* Decisions timeline */}
-            <div>
-              <div className="playground-topbar" style={{ marginBottom: 8 }}>
-                <div>
-                  <span className="eyebrow">Decisions</span>
-                </div>
-                <div style={{ display: "flex", gap: 4 }}>
-                  {(["all", "allow", "deny"] as const).map((f) => (
-                    <button
-                      key={f}
-                      onClick={() => setAuditFilter(f)}
-                      style={{
-                        fontSize: 10,
-                        padding: "2px 6px",
-                        borderRadius: 6,
-                        border: "none",
-                        cursor: "pointer",
-                        background:
-                          auditFilter === f
-                            ? "rgba(255,255,255,.15)"
-                            : "rgba(255,255,255,.05)",
-                        color: "inherit",
-                        textTransform: "uppercase",
-                      }}
-                    >
-                      {f}
-                    </button>
-                  ))}
-                </div>
               </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                {audit
-                  .filter((row) => auditFilter === "all" || row.decision === auditFilter)
-                  .map((row) => (
-                    <div
-                      key={row.id}
-                      onClick={() =>
-                        setExpandedAuditId(expandedAuditId === row.id ? null : row.id)
-                      }
-                      style={{
-                        padding: "6px 8px",
-                        borderRadius: 8,
-                        background:
-                          row.decision === "deny"
-                            ? "rgba(255,80,80,.08)"
-                            : "rgba(80,220,120,.06)",
-                        cursor: "pointer",
-                        fontSize: 12,
+            )}
+
+            {policyTab === "vault" && (
+              <div className="policy-section">
+                <div className="playground-topbar" style={{ marginBottom: 4 }}>
+                  <div>
+                    <span className="eyebrow">Vault · {selected.ownerId}</span>
+                  </div>
+                  {currentRole === "admin" && (
+                    <button
+                      className="button button-ghost"
+                      style={{ minHeight: 30, fontSize: 11, padding: "0 10px" }}
+                      onClick={() => {
+                        setVaultForm({
+                          owner: selected.ownerId ?? "",
+                          key: "",
+                          value: "",
+                          redactedView: "",
+                        });
+                        setShowVaultForm((v) => !v);
                       }}
                     >
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        <span
-                          className={
-                            "mini-dot mini-" +
-                            (row.decision === "allow" ? "ready" : "error")
-                          }
-                        />
-                        <strong
-                          style={{ fontSize: 10, textTransform: "uppercase" }}
-                        >
-                          {row.decision}
-                        </strong>
-                        <code
-                          style={{
-                            fontSize: 11,
-                            flex: 1,
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          {row.method ?? "—"} {row.resource}
-                        </code>
-                        <span style={{ fontSize: 10, opacity: 0.5 }}>
-                          {formatTime(row.timestamp)}
-                        </span>
-                      </div>
-                      {expandedAuditId === row.id && (
-                        <div style={{ marginTop: 4, fontSize: 11, opacity: 0.7 }}>
-                          <div>scope: {row.scope ?? "—"}</div>
-                          <div>reason: {row.reason}</div>
-                          {row.runId && <div>run: {row.runId.slice(0, 8)}</div>}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                {audit.length === 0 && (
-                  <div style={{ color: "rgba(255,255,255,.5)", fontSize: 12 }}>
-                    No decisions yet — send a prompt.
+                      {showVaultForm ? "Close" : "＋ Add secret"}
+                    </button>
+                  )}
+                </div>
+
+                {currentRole !== "admin" && (
+                  <div className="perm-empty">
+                    Only admins may manage secrets. You can view your own secrets read-only.
                   </div>
                 )}
-              </div>
-            </div>
 
-            {/* Policy reference */}
-            <details style={{ marginTop: 16 }}>
-              <summary style={{ fontSize: 12, opacity: 0.7, cursor: "pointer" }}>
-                Policy reference
-              </summary>
-              <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4 }}>
-                <p style={{ margin: "0 0 2px" }}>🟢 baseline: read:secrets:&lt;owner&gt;, act:deploy:dev</p>
-                <p style={{ margin: "0 0 2px" }}>🟠 elevated: write:secrets:*, act:deploy:prod, cross-user</p>
-                <p style={{ margin: 0 }}>🔴 unknown: rejected</p>
+                {currentRole === "admin" && showVaultForm && (
+                  <form className="vault-form" onSubmit={addSecret}>
+                    <div className="form-grid">
+                      <label>
+                        Owner
+                        <input
+                          value={vaultForm.owner}
+                          onChange={(event) =>
+                            setVaultForm({ ...vaultForm, owner: event.target.value })
+                          }
+                          required
+                          maxLength={60}
+                        />
+                      </label>
+                      <label>
+                        Key
+                        <input
+                          value={vaultForm.key}
+                          onChange={(event) =>
+                            setVaultForm({ ...vaultForm, key: event.target.value })
+                          }
+                          required
+                          maxLength={120}
+                          placeholder="db-url"
+                        />
+                      </label>
+                    </div>
+                    <label>
+                      Value
+                      <textarea
+                        value={vaultForm.value}
+                        onChange={(event) =>
+                          setVaultForm({ ...vaultForm, value: event.target.value })
+                        }
+                        rows={2}
+                        required
+                      />
+                    </label>
+                    <label>
+                      Redacted label (optional)
+                      <input
+                        value={vaultForm.redactedView}
+                        onChange={(event) =>
+                          setVaultForm({ ...vaultForm, redactedView: event.target.value })
+                        }
+                        maxLength={200}
+                        placeholder="postgres://***:***@db/agentdb"
+                      />
+                    </label>
+                    <div className="modal-footer" style={{ marginTop: 4 }}>
+                      <button
+                        className="button button-primary"
+                        disabled={
+                          busy ||
+                          !vaultForm.owner.trim() ||
+                          !vaultForm.key.trim() ||
+                          !vaultForm.value
+                        }
+                      >
+                        {busy ? <Spinner /> : "Save secret"}
+                      </button>
+                    </div>
+                  </form>
+                )}
+
+                <div className="vault-grid">
+                  {vaultSecrets.map((s) => (
+                    <div className="vault-card" key={s.owner + "/" + s.key}>
+                      <div className="vault-card-head">
+                        <code className="vault-key">{s.owner}/{s.key}</code>
+                        {currentRole === "admin" && (
+                          <button
+                            className="perm-x"
+                            onClick={() => revokeSecret(s.owner, s.key)}
+                            disabled={busy}
+                            title="Revoke secret"
+                          >
+                            ×
+                          </button>
+                        )}
+                      </div>
+                      <div className="vault-redacted">{s.redactedView}</div>
+                    </div>
+                  ))}
+                  {vaultSecrets.length === 0 && (
+                    <div className="perm-empty">No secrets for {selected.ownerId}.</div>
+                  )}
+                </div>
               </div>
-            </details>
+            )}
+
+            {policyTab === "decisions" && (
+              <div className="policy-section">
+                <div className="playground-topbar" style={{ marginBottom: 4 }}>
+                  <div>
+                    <span className="eyebrow">Decisions</span>
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                    {(["all", "allow", "deny"] as const).map((f) => (
+                      <button
+                        key={f}
+                        type="button"
+                        className={"audit-filter" + (auditFilter === f ? " audit-filter-active" : "")}
+                        onClick={() => setAuditFilter(f)}
+                      >
+                        {f}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  {audit
+                    .filter((row) => auditFilter === "all" || row.decision === auditFilter)
+                    .map((row) => (
+                      <div
+                        key={row.id}
+                        className={"audit-row" + (row.decision === "deny" ? " audit-deny" : "")}
+                        onClick={() =>
+                          setExpandedAuditId(expandedAuditId === row.id ? null : row.id)
+                        }
+                      >
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <span
+                            className={"mini-dot mini-" + (row.decision === "allow" ? "ready" : "error")}
+                          />
+                          <strong style={{ fontSize: 10, textTransform: "uppercase" }}>
+                            {row.decision}
+                          </strong>
+                          <code
+                            style={{
+                              fontSize: 11,
+                              flex: 1,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {row.method ?? "—"} {row.resource}
+                          </code>
+                          <span style={{ fontSize: 10, opacity: 0.5 }}>
+                            {formatTime(row.timestamp)}
+                          </span>
+                        </div>
+                        {expandedAuditId === row.id && (
+                          <div style={{ marginTop: 4, fontSize: 11, opacity: 0.7 }}>
+                            <div>scope: {row.scope ?? "—"}</div>
+                            <div>reason: {row.reason}</div>
+                            {row.runId && <div>run: {row.runId.slice(0, 8)}</div>}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  {audit.length === 0 && (
+                    <div className="perm-empty">No decisions yet — send a prompt.</div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {policyTab === "owner" && (
+              <div className="policy-section">
+                <div className="playground-topbar" style={{ marginBottom: 4 }}>
+                  <div>
+                    <span className="eyebrow">Ownership &amp; identity</span>
+                  </div>
+                </div>
+
+                <div className="owner-card">
+                  <span className="eyebrow">Acting on behalf of</span>
+                  <div className="owner-row">
+                    <strong>{selected.ownerId}</strong>
+                    <span className={"role-badge role-" + ownerRole}>{ownerRole}</span>
+                  </div>
+                  <code className="owner-principal">user:{selected.ownerId}</code>
+                </div>
+
+                <div className="owner-card">
+                  <span className="eyebrow">Agent identity</span>
+                  <div className="owner-kv">
+                    <span>id</span>
+                    <code>{selected.id.slice(0, 8)}</code>
+                  </div>
+                  <div className="owner-kv">
+                    <span>status</span>
+                    <code>{selected.status}</code>
+                  </div>
+                  <div className="owner-kv">
+                    <span>session</span>
+                    <code>{selected.codexThreadId ? selected.codexThreadId.slice(0, 8) : "none"}</code>
+                  </div>
+                  <div className="owner-kv">
+                    <span>workspace</span>
+                    <code>{selected.workspacePath}</code>
+                  </div>
+                  <div className="owner-kv">
+                    <span>created</span>
+                    <code>{formatTime(selected.createdAt)}</code>
+                  </div>
+                </div>
+
+                <div className="owner-card">
+                  <span className="eyebrow">Credential</span>
+                  <p className="owner-note">
+                    Scopes are minted into a per-run Tier 1 credential at run start. Revoke it
+                    to degrade the active run — the next relay request returns 401.
+                  </p>
+                  <button
+                    className="button button-ghost"
+                    style={{ minHeight: 32, fontSize: 11, alignSelf: "flex-start" }}
+                    onClick={revokeCredential}
+                    disabled={busy || selected.status === "busy"}
+                  >
+                    Revoke credential
+                  </button>
+                </div>
+
+                <div className="owner-card">
+                  <span className="eyebrow">Owner's secret keys</span>
+                  {vaultSecrets.length > 0 ? (
+                    <div className="vault-grid">
+                      {vaultSecrets.map((s) => (
+                        <div className="vault-card" key={s.owner + "/" + s.key}>
+                          <code className="vault-key">{s.key}</code>
+                          <div className="vault-redacted">{s.redactedView}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="perm-empty">
+                      No secrets registered for {selected.ownerId}.
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
           </>
         ) : (
-          <div style={{ color: "rgba(255,255,255,.5)", fontSize: 13 }}>
-            Select an agent to see its permissions + decisions.
-          </div>
+          <div className="perm-empty">Select an agent to see its permissions + decisions.</div>
         )}
       </aside>
 
@@ -1119,6 +1519,86 @@ export default function App() {
                 }
               >
                 {busy ? <Spinner /> : plan ? "Approve & create" : "Plan permissions"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {showAddUser && (
+        <div className="modal-backdrop" onMouseDown={() => setShowAddUser(false)}>
+          <form
+            className="modal"
+            style={{ width: "min(420px, 100%)" }}
+            onSubmit={addUser}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="modal-heading">
+              <div>
+                <span className="eyebrow">Users &amp; roles</span>
+                <h2>Add user</h2>
+                <p>
+                  Register a mock principal. Non-admin users see only their own secrets and
+                  agents.
+                </p>
+              </div>
+              <button type="button" onClick={() => setShowAddUser(false)}>
+                ×
+              </button>
+            </div>
+            <label>
+              User ID
+              <input
+                autoFocus
+                value={newUserForm.userId}
+                onChange={(event) =>
+                  setNewUserForm({ ...newUserForm, userId: event.target.value })
+                }
+                required
+                maxLength={60}
+                placeholder="e.g. carol"
+              />
+            </label>
+            <label>
+              Role
+              <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                {(["user", "admin"] as const).map((r) => (
+                  <button
+                    key={r}
+                    type="button"
+                    onClick={() => setNewUserForm({ ...newUserForm, role: r })}
+                    style={{
+                      flex: 1,
+                      minHeight: 36,
+                      borderRadius: 9,
+                      border: "1px solid",
+                      borderColor: newUserForm.role === r ? "#6954d9" : "#d9d7cf",
+                      background: newUserForm.role === r ? "#efecff" : "#fff",
+                      color: newUserForm.role === r ? "#513db9" : "#575851",
+                      fontWeight: 600,
+                      fontSize: 12,
+                      cursor: "pointer",
+                      textTransform: "capitalize",
+                    }}
+                  >
+                    {r}
+                  </button>
+                ))}
+              </div>
+            </label>
+            <div className="modal-footer">
+              <button
+                type="button"
+                className="button button-ghost"
+                onClick={() => setShowAddUser(false)}
+              >
+                Cancel
+              </button>
+              <button
+                className="button button-primary"
+                disabled={busy || !newUserForm.userId.trim()}
+              >
+                {busy ? <Spinner /> : "Add user"}
               </button>
             </div>
           </form>

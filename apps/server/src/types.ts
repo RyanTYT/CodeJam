@@ -62,6 +62,7 @@ export interface Principal {
   kind: PrincipalKind;
   id: string;
   userId: string | undefined;
+  role: "admin" | "user";
   runId: string | undefined;
   scopes: string[];
   expiresAt: string | undefined;
@@ -73,6 +74,7 @@ export interface AgentCredential {
   agentId: string;
   runId: string;
   ownerId: string;
+  role: "admin" | "user";
   scopes: string[];
   issuedAt: string;
   expiresAt: string;
@@ -85,6 +87,21 @@ export interface MockResource {
   key: string;
   value: string;
   redactedView: string;
+}
+
+/** A redacted view of a stored secret — the value never leaves the server. */
+export interface Secret {
+  owner: string;
+  key: string;
+  redactedView: string;
+}
+
+/** A registered principal in the central users store. Admins can access all secrets. */
+export interface User {
+  id: string;
+  userId: string;
+  role: "admin" | "user";
+  createdAt: string;
 }
 
 /** Protected state asset for the denied-write demo. */
@@ -103,13 +120,13 @@ export interface Capability {
   scope: string;
 }
 
-// Normalized authorization context consumed by 
+// Normalized authorization context consumed by
 // enforcement point
 export interface AuthorizationContext {
   agentId: string;
   runId: string;
   ownerId: string;
-
+  isAdmin: boolean;
   capabilities: Capability[];
 
   // Temporarily Optional since the current
@@ -188,6 +205,7 @@ export interface Database {
   mockResources: MockResource[];
   deployStates: DeployState[];
   audit: Audit[];
+  users: User[];
 }
 
 export interface CreateAgentInput {

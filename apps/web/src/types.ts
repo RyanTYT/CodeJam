@@ -77,3 +77,16 @@ export interface IntentPlan {
   justification: string;
   source: "llm" | "fallback";
 }
+
+export interface Secret {
+  owner: string;
+  key: string;
+  redactedView: string;
+}
+
+export interface User {
+  id: string;
+  userId: string;
+  role: "admin" | "user";
+  createdAt: string;
+}
