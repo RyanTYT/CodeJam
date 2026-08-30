@@ -14,6 +14,7 @@ import type {
   Secret,
   User,
 } from "./types.js";
+import { calculateAgentRiskProfile, assessOperationRisk } from "./risk-engine.js";
 
 const now = () => new Date().toISOString();
 const TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
@@ -429,7 +430,12 @@ export class MockResourceService {
     const upstream = await this.handleUpstream(method, path, body);
     const redacted = this.redactEnvelope(scope, upstream);
 
-    await this.writeAudit({
+    // Phase 2: Calculate risk scores before audit
+    const db = this.store.snapshot();
+    const agent = db.agents.find((a) => a.id === credential.agentId);
+    const recentAudit = db.audit.filter((a) => a.agentId === credential.agentId).slice(-20); // Last 20 operations
+    
+    const auditEntry: Omit<Audit, "id" | "timestamp"> = {
       humanPrincipalId: "user:" + credential.ownerId,
       agentId: credential.agentId,
       agentPrincipalId: "agent:" + credential.agentId,
@@ -443,7 +449,33 @@ export class MockResourceService {
       scope: scope.scope,
       decision: "allow",
       reason: "scope match",
-    });
+    };
+
+    if (agent) {
+      // Calculate agent risk profile
+      const agentProfile = calculateAgentRiskProfile(agent, recentAudit);
+      
+      // Assess operation risk
+      const operationAssessment = assessOperationRisk(
+        agent,
+        agentProfile,
+        scope.resource,
+        method,
+        recentAudit,
+      );
+
+      if (operationAssessment.operationRiskLevel !== undefined) {
+        auditEntry.operationRiskLevel = operationAssessment.operationRiskLevel;
+      }
+      if (operationAssessment.operationRiskScore !== undefined) {
+        auditEntry.operationRiskScore = operationAssessment.operationRiskScore;
+      }
+      if (operationAssessment.operationRiskFactors) {
+        auditEntry.operationRiskFactors = operationAssessment.operationRiskFactors;
+      }
+    }
+
+    await this.writeAudit(auditEntry);
 
     return { status: upstream.status, body: redacted };
   }
