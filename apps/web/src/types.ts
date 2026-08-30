@@ -8,6 +8,8 @@ export interface Agent {
   instructions: string;
   status: AgentStatus;
   ownerId?: string;
+  scopes?: string[];
+  plan?: IntentPlan | null;
   workspacePath: string;
   codexThreadId: string | null;
   lastError: string | null;
@@ -64,4 +66,14 @@ export interface SystemInfo {
   containerEngine: string | null;
   runtime: string;
   mockResourcePort?: number;
+}
+
+export interface IntentPlan {
+  intent: string;
+  requestedScopes: string[];
+  baselineScopes: string[];
+  elevatedScopes: string[];
+  unknownScopes: string[];
+  justification: string;
+  source: "llm" | "fallback";
 }

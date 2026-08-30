@@ -1,4 +1,4 @@
-import type { Agent, AgentRun, Audit, Message, SystemInfo } from "./types";
+import type { Agent, AgentRun, Audit, IntentPlan, Message, SystemInfo } from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -44,12 +44,25 @@ export const api = {
   listAgents: () => request<{ agents: Agent[] }>("/api/agents"),
   createAgent: (body: {
     name: string;
-    description: string;
-    instructions: string;
+    description?: string;
+    instructions?: string;
+    intent?: string;
+    scopes?: string[];
+    plan?: IntentPlan;
   }) =>
     request<{ agent: Agent }>("/api/agents", {
       method: "POST",
       body: JSON.stringify(body),
+    }),
+  removeScope: (id: string, scope: string) =>
+    request<{ agent: Agent }>("/api/agents/" + id + "/scopes/revoke", {
+      method: "POST",
+      body: JSON.stringify({ scope }),
+    }),
+  planAgent: (intent: string) =>
+    request<{ plan: IntentPlan }>("/api/agents/plan", {
+      method: "POST",
+      body: JSON.stringify({ intent }),
     }),
   updateAgent: (
     id: string,

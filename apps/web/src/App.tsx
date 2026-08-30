@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken, setMockUser } from "./api";
-import type { Agent, AgentRun, Audit, Message, SystemInfo } from "./types";
+import type { Agent, AgentRun, Audit, IntentPlan, Message, SystemInfo } from "./types";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -20,6 +20,18 @@ function formatTime(value: string): string {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
+}
+
+function classifyScopeClient(
+  scope: string,
+  ownerId: string | undefined,
+): "baseline" | "elevated" | "unknown" {
+  const m = scope.match(/^read:secrets:(.+)$/);
+  if (m && m[1]) return m[1] === ownerId ? "baseline" : "elevated";
+  if (/^write:secrets:/.test(scope)) return "elevated";
+  if (scope === "act:deploy:dev") return "baseline";
+  if (scope === "act:deploy:prod") return "elevated";
+  return "unknown";
 }
 
 function StatusPill({ status }: { status: Agent["status"] }) {
@@ -51,6 +63,11 @@ export default function App() {
   const [authInput, setAuthInput] = useState("");
   const [currentUser, setCurrentUser] = useState("default");
   const [audit, setAudit] = useState<Audit[]>([]);
+  const [intent, setIntent] = useState("");
+  const [plan, setPlan] = useState<IntentPlan | null>(null);
+  const [approvedElevated, setApprovedElevated] = useState<Set<string>>(new Set());
+  const [auditFilter, setAuditFilter] = useState<"all" | "allow" | "deny">("all");
+  const [expandedAuditId, setExpandedAuditId] = useState<string | null>(null);
   const messageEnd = useRef<HTMLDivElement>(null);
   const selectedIdRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
@@ -161,6 +178,61 @@ export default function App() {
     }
   };
 
+  const planIntent = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!intent.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const { plan: next } = await api.planAgent(intent.trim());
+      setPlan(next);
+      setApprovedElevated(new Set(next.elevatedScopes));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleElevated = (scope: string, checked: boolean) => {
+    setApprovedElevated((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(scope);
+      else next.delete(scope);
+      return next;
+    });
+  };
+
+  const approveAndCreate = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!plan || !form.name.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const scopes = [
+        ...plan.baselineScopes,
+        ...plan.elevatedScopes.filter((scope) => approvedElevated.has(scope)),
+      ];
+      const { agent } = await api.createAgent({
+        name: form.name.trim(),
+        intent: intent.trim(),
+        scopes,
+        plan,
+      });
+      await refreshAgents();
+      setSelectedId(agent.id);
+      setShowCreate(false);
+      setForm(emptyForm);
+      setIntent("");
+      setPlan(null);
+      setApprovedElevated(new Set());
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const saveAgent = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!selected) return;
@@ -227,6 +299,22 @@ export default function App() {
     }
   };
 
+  const revokeScope = async (scope: string) => {
+    if (!selected) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.removeScope(selected.id, scope);
+      await refreshAgents();
+      const result = await api.audit(selected.id);
+      if (selectedIdRef.current === selected.id) setAudit(result.audit);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const pollRun = async (runId: string, agentId: string) => {
     if (pollingRunIds.current.has(runId)) return;
     pollingRunIds.current.add(runId);
@@ -235,14 +323,13 @@ export default function App() {
         await new Promise((resolve) => window.setTimeout(resolve, 900));
         if (!mountedRef.current) return;
         const result = await api.run(runId);
-        if (selectedIdRef.current === agentId) setActiveRun(result.run);
+        const auditResult = await api.audit(agentId);
+        if (selectedIdRef.current === agentId) {
+          setActiveRun(result.run);
+          setAudit(auditResult.audit);
+        }
         if (!["queued", "running"].includes(result.run.status)) {
-          const [, , auditResult] = await Promise.all([
-            refreshMessages(agentId),
-            refreshAgents(),
-            api.audit(agentId),
-          ]);
-          if (selectedIdRef.current === agentId) setAudit(auditResult.audit);
+          await Promise.all([refreshMessages(agentId), refreshAgents()]);
           return;
         }
       }
@@ -354,23 +441,32 @@ export default function App() {
 
         <div className="user-switcher">
           <span className="eyebrow">Mock user</span>
-          <select
-            value={currentUser}
-            onChange={(event) => {
-              setCurrentUser(event.target.value);
-              setSelectedId(null);
-            }}
-          >
-            <option value="default">default</option>
-            <option value="alice">alice</option>
-            <option value="bob">bob</option>
-          </select>
+          <div className="segmented">
+            {(["default", "alice", "bob"] as const).map((user) => (
+              <button
+                key={user}
+                type="button"
+                className={
+                  "segment" + (currentUser === user ? " segment-active" : "")
+                }
+                onClick={() => {
+                  setCurrentUser(user);
+                  setSelectedId(null);
+                }}
+              >
+                {user}
+              </button>
+            ))}
+          </div>
         </div>
 
         <button
           className="button button-primary create-button"
           onClick={() => {
             setForm(emptyForm);
+            setIntent("");
+            setPlan(null);
+            setApprovedElevated(new Set());
             setShowCreate(true);
           }}
         >
@@ -635,76 +731,6 @@ export default function App() {
                 </div>
               </form>
             </section>
-
-            <section
-              className="audit-panel"
-              style={{
-                marginTop: 16,
-                padding: "16px 20px",
-                border: "1px solid rgba(255,255,255,.08)",
-                borderRadius: 14,
-              }}
-            >
-              <div className="playground-topbar" style={{ marginBottom: 12 }}>
-                <div>
-                  <span className="eyebrow">Bouncer audit</span>
-                  <h2>Policy decisions</h2>
-                </div>
-                <div className="session-info">
-                  {audit.length} decision{audit.length === 1 ? "" : "s"}
-                </div>
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {audit.length === 0 ? (
-                  <div style={{ color: "rgba(255,255,255,.5)", fontSize: 13 }}>
-                    No policy decisions recorded for this Agent yet. Send a prompt that asks the
-                    Agent to curl the mock resource service.
-                  </div>
-                ) : (
-                  audit.map((row) => (
-                    <div
-                      key={row.id}
-                      style={{
-                        display: "grid",
-                        gridTemplateColumns: "auto auto 1fr auto auto",
-                        gap: 8,
-                        alignItems: "center",
-                        padding: "6px 8px",
-                        borderRadius: 8,
-                        background:
-                          row.decision === "deny"
-                            ? "rgba(255,80,80,.08)"
-                            : "rgba(80,220,120,.06)",
-                      }}
-                    >
-                      <span
-                        className={"mini-dot mini-" + (row.decision === "allow" ? "ready" : "error")}
-                      />
-                      <strong
-                        style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: ".04em" }}
-                      >
-                        {row.decision}
-                      </strong>
-                      <span
-                        style={{
-                          fontSize: 13,
-                          fontFamily: "monospace",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        {row.method ?? "—"} {row.resource}
-                      </span>
-                      <span style={{ fontSize: 12, opacity: 0.7 }}>{row.reason}</span>
-                      <span style={{ fontSize: 12, opacity: 0.5 }}>
-                        {formatTime(row.timestamp)}
-                      </span>
-                    </div>
-                  ))
-                )}
-              </div>
-            </section>
           </>
         ) : (
           <div className="no-agent">
@@ -716,6 +742,9 @@ export default function App() {
               className="button button-primary"
               onClick={() => {
                 setForm(emptyForm);
+                setIntent("");
+                setPlan(null);
+                setApprovedElevated(new Set());
                 setShowCreate(true);
               }}
             >
@@ -725,20 +754,235 @@ export default function App() {
         )}
       </main>
 
+      <aside className="policy-console">
+        {selected ? (
+          <>
+            {/* Permissions card */}
+            <div style={{ marginBottom: 16 }}>
+              <div className="playground-topbar" style={{ marginBottom: 8 }}>
+                <div>
+                  <span className="eyebrow">Permissions</span>
+                </div>
+                {selected.plan && (
+                  <span style={{ fontSize: 11, opacity: 0.6 }}>plan: {selected.plan.source}</span>
+                )}
+              </div>
+              {selected.plan?.intent && (
+                <p style={{ fontSize: 12, opacity: 0.7, margin: "0 0 8px" }}>
+                  Intent: {selected.plan.intent}
+                </p>
+              )}
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {selected.scopes?.map((scope) => {
+                  const risk = classifyScopeClient(scope, selected.ownerId);
+                  const bg =
+                    risk === "baseline"
+                      ? "rgba(80,220,120,.08)"
+                      : risk === "elevated"
+                        ? "rgba(255,180,80,.1)"
+                        : "rgba(255,80,80,.08)";
+                  return (
+                    <div
+                      key={scope}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                        padding: "4px 8px",
+                        borderRadius: 8,
+                        background: bg,
+                        fontSize: 12,
+                      }}
+                    >
+                      <span
+                        className={"mini-dot mini-" + (risk === "baseline" ? "ready" : "error")}
+                      />
+                      <code
+                        style={{
+                          fontSize: 11,
+                          flex: 1,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {scope}
+                      </code>
+                      <button
+                        onClick={() => revokeScope(scope)}
+                        disabled={busy}
+                        title="Revoke this scope"
+                        style={{
+                          background: "none",
+                          border: "none",
+                          color: "rgba(255,255,255,.4)",
+                          cursor: "pointer",
+                          fontSize: 14,
+                          padding: 0,
+                        }}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+              {selected.plan && (
+                <details style={{ marginTop: 8 }}>
+                  <summary style={{ fontSize: 12, opacity: 0.7, cursor: "pointer" }}>
+                    View plan
+                  </summary>
+                  <div style={{ fontSize: 11, opacity: 0.8, marginTop: 4 }}>
+                    <p style={{ margin: "0 0 4px" }}>{selected.plan.justification}</p>
+                    <p style={{ margin: "0 0 2px" }}>
+                      requested: {selected.plan.requestedScopes.join(", ") || "—"}
+                    </p>
+                    <p style={{ margin: "0 0 2px" }}>
+                      baseline: {selected.plan.baselineScopes.join(", ") || "—"}
+                    </p>
+                    <p style={{ margin: "0 0 2px" }}>
+                      elevated: {selected.plan.elevatedScopes.join(", ") || "—"}
+                    </p>
+                    <p style={{ margin: 0 }}>
+                      unknown: {selected.plan.unknownScopes.join(", ") || "—"}
+                    </p>
+                  </div>
+                </details>
+              )}
+            </div>
+
+            {/* Decisions timeline */}
+            <div>
+              <div className="playground-topbar" style={{ marginBottom: 8 }}>
+                <div>
+                  <span className="eyebrow">Decisions</span>
+                </div>
+                <div style={{ display: "flex", gap: 4 }}>
+                  {(["all", "allow", "deny"] as const).map((f) => (
+                    <button
+                      key={f}
+                      onClick={() => setAuditFilter(f)}
+                      style={{
+                        fontSize: 10,
+                        padding: "2px 6px",
+                        borderRadius: 6,
+                        border: "none",
+                        cursor: "pointer",
+                        background:
+                          auditFilter === f
+                            ? "rgba(255,255,255,.15)"
+                            : "rgba(255,255,255,.05)",
+                        color: "inherit",
+                        textTransform: "uppercase",
+                      }}
+                    >
+                      {f}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {audit
+                  .filter((row) => auditFilter === "all" || row.decision === auditFilter)
+                  .map((row) => (
+                    <div
+                      key={row.id}
+                      onClick={() =>
+                        setExpandedAuditId(expandedAuditId === row.id ? null : row.id)
+                      }
+                      style={{
+                        padding: "6px 8px",
+                        borderRadius: 8,
+                        background:
+                          row.decision === "deny"
+                            ? "rgba(255,80,80,.08)"
+                            : "rgba(80,220,120,.06)",
+                        cursor: "pointer",
+                        fontSize: 12,
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span
+                          className={
+                            "mini-dot mini-" +
+                            (row.decision === "allow" ? "ready" : "error")
+                          }
+                        />
+                        <strong
+                          style={{ fontSize: 10, textTransform: "uppercase" }}
+                        >
+                          {row.decision}
+                        </strong>
+                        <code
+                          style={{
+                            fontSize: 11,
+                            flex: 1,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {row.method ?? "—"} {row.resource}
+                        </code>
+                        <span style={{ fontSize: 10, opacity: 0.5 }}>
+                          {formatTime(row.timestamp)}
+                        </span>
+                      </div>
+                      {expandedAuditId === row.id && (
+                        <div style={{ marginTop: 4, fontSize: 11, opacity: 0.7 }}>
+                          <div>scope: {row.scope ?? "—"}</div>
+                          <div>reason: {row.reason}</div>
+                          {row.runId && <div>run: {row.runId.slice(0, 8)}</div>}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                {audit.length === 0 && (
+                  <div style={{ color: "rgba(255,255,255,.5)", fontSize: 12 }}>
+                    No decisions yet — send a prompt.
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Policy reference */}
+            <details style={{ marginTop: 16 }}>
+              <summary style={{ fontSize: 12, opacity: 0.7, cursor: "pointer" }}>
+                Policy reference
+              </summary>
+              <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4 }}>
+                <p style={{ margin: "0 0 2px" }}>🟢 baseline: read:secrets:&lt;owner&gt;, act:deploy:dev</p>
+                <p style={{ margin: "0 0 2px" }}>🟠 elevated: write:secrets:*, act:deploy:prod, cross-user</p>
+                <p style={{ margin: 0 }}>🔴 unknown: rejected</p>
+              </div>
+            </details>
+          </>
+        ) : (
+          <div style={{ color: "rgba(255,255,255,.5)", fontSize: 13 }}>
+            Select an agent to see its permissions + decisions.
+          </div>
+        )}
+      </aside>
+
       {showCreate && (
         <div className="modal-backdrop" onMouseDown={() => setShowCreate(false)}>
           <form
             className="modal"
-            onSubmit={createAgent}
+            onSubmit={plan ? approveAndCreate : planIntent}
             onMouseDown={(event) => event.stopPropagation()}
           >
             <div className="modal-heading">
               <div>
-                <span className="eyebrow">New workspace</span>
+                <span className="eyebrow">Intent-bound permissions</span>
                 <h2>Create an Agent</h2>
-                <p>Each Agent gets a persistent folder and a resumable Codex session.</p>
+                <p>
+                  State what you want the agent to do — the planner derives the minimum
+                  permissions; you approve the risky ones.
+                </p>
               </div>
-              <button type="button" onClick={() => setShowCreate(false)}>×</button>
+              <button type="button" onClick={() => setShowCreate(false)}>
+                ×
+              </button>
             </div>
             <label>
               Name
@@ -752,27 +996,112 @@ export default function App() {
               />
             </label>
             <label>
-              Description
-              <input
-                placeholder="Builds polished React prototypes"
-                value={form.description}
-                onChange={(event) =>
-                  setForm({ ...form, description: event.target.value })
-                }
-                maxLength={500}
-              />
-            </label>
-            <label>
-              Instructions
+              Intent
               <textarea
-                value={form.instructions}
-                onChange={(event) =>
-                  setForm({ ...form, instructions: event.target.value })
-                }
-                rows={6}
+                placeholder="e.g. build a todo app that reads my DB url and deploys to dev"
+                value={intent}
+                onChange={(event) => {
+                  setIntent(event.target.value);
+                  setPlan(null);
+                }}
+                rows={3}
                 maxLength={10_000}
               />
             </label>
+            {plan && (
+              <div
+                style={{
+                  marginTop: 8,
+                  padding: "12px 14px",
+                  border: "1px solid rgba(255,255,255,.1)",
+                  borderRadius: 12,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 8,
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                  }}
+                >
+                  <span className="eyebrow">Permissions plan · {plan.source}</span>
+                  <span style={{ fontSize: 12, opacity: 0.6 }}>
+                    {plan.baselineScopes.length} baseline · {plan.elevatedScopes.length}{" "}
+                    elevated · {plan.unknownScopes.length} unknown
+                  </span>
+                </div>
+                <p style={{ fontSize: 13, opacity: 0.85, margin: 0 }}>{plan.justification}</p>
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  {plan.baselineScopes.map((scope) => (
+                    <div
+                      key={scope}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        padding: "4px 8px",
+                        borderRadius: 8,
+                        background: "rgba(80,220,120,.08)",
+                        fontSize: 13,
+                      }}
+                    >
+                      <span className="mini-dot mini-ready" />
+                      <code style={{ fontSize: 12 }}>{scope}</code>
+                      <span style={{ opacity: 0.6, fontSize: 12 }}>baseline · auto-granted</span>
+                    </div>
+                  ))}
+                  {plan.elevatedScopes.map((scope) => (
+                    <label
+                      key={scope}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        padding: "4px 8px",
+                        borderRadius: 8,
+                        background: "rgba(255,180,80,.1)",
+                        fontSize: 13,
+                        cursor: "pointer",
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={approvedElevated.has(scope)}
+                        onChange={(event) => toggleElevated(scope, event.target.checked)}
+                      />
+                      <span className="mini-dot mini-error" />
+                      <code style={{ fontSize: 12 }}>{scope}</code>
+                      <span style={{ opacity: 0.7, fontSize: 12 }}>
+                        elevated — approve? (uncheck to deny → relay will 403)
+                      </span>
+                    </label>
+                  ))}
+                  {plan.unknownScopes.map((scope) => (
+                    <div
+                      key={scope}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        padding: "4px 8px",
+                        borderRadius: 8,
+                        background: "rgba(255,80,80,.08)",
+                        fontSize: 13,
+                      }}
+                    >
+                      <span className="mini-dot mini-error" />
+                      <code style={{ fontSize: 12 }}>{scope}</code>
+                      <span style={{ opacity: 0.6, fontSize: 12 }}>
+                        unknown · rejected (not in taxonomy)
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             <div className="modal-footer">
               <button
                 type="button"
@@ -781,8 +1110,15 @@ export default function App() {
               >
                 Cancel
               </button>
-              <button className="button button-primary" disabled={busy}>
-                {busy ? <Spinner /> : "Create Agent"}
+              <button
+                className="button button-primary"
+                disabled={
+                  busy ||
+                  !intent.trim() ||
+                  (plan ? !form.name.trim() : false)
+                }
+              >
+                {busy ? <Spinner /> : plan ? "Approve & create" : "Plan permissions"}
               </button>
             </div>
           </form>
