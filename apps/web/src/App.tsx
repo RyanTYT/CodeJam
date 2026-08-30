@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken, setMockUser } from "./api";
-import type { Agent, AgentRun, Audit, IntentPlan, Message, Secret, SystemInfo, User } from "./types";
+import type { Agent, AgentRun, Audit, IntentPlan, Message, Secret, SystemInfo, User, WorkflowNode } from "./types";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -104,6 +104,7 @@ export default function App() {
   const [authInput, setAuthInput] = useState("");
   const [currentUser, setCurrentUser] = useState("default");
   const [audit, setAudit] = useState<Audit[]>([]);
+  const [workflow, setWorkflow] = useState<WorkflowNode[]>([]);
   const [intent, setIntent] = useState("");
   const [plan, setPlan] = useState<IntentPlan | null>(null);
   /** Scopes the owner has picked for the new agent. Pre-filled by the plan
@@ -146,6 +147,17 @@ export default function App() {
     () => agents.find((agent) => agent.id === selectedId) ?? null,
     [agents, selectedId],
   );
+
+  const workflowByParent = useMemo(() => {
+    const next = new Map<string | undefined, WorkflowNode[]>();
+    for (const node of workflow) {
+      const key = node.parentId ?? "root";
+      const existing = next.get(key) ?? [];
+      existing.push(node);
+      next.set(key, existing);
+    }
+    return next;
+  }, [workflow]);
 
   const ownerRole: "admin" | "user" = selected
     ? (users.find((u) => u.userId === selected.ownerId)?.role ?? "user")
@@ -244,6 +256,7 @@ export default function App() {
     setShowSettings(false);
     setShowVaultForm(false);
     setAudit([]);
+    setWorkflow([]);
     setSelectedForRevoke(new Set());
     if (!selectedId) {
       setMessages([]);
@@ -255,11 +268,21 @@ export default function App() {
       api.audit(selectedId),
       refreshSecrets(),
     ])
-      .then(([, runsResult, auditResult]) => {
+      .then(async ([, runsResult, auditResult]) => {
         if (selectedIdRef.current !== selectedId) return;
         setAudit(auditResult.audit);
         const latest = runsResult.runs[0] ?? null;
         setActiveRun(latest);
+        if (latest) {
+          try {
+            const workflowResult = await api.workflow(latest.id);
+            if (selectedIdRef.current === selectedId) {
+              setWorkflow(workflowResult.workflow);
+            }
+          } catch (reason) {
+            setError(reason instanceof Error ? reason.message : String(reason));
+          }
+        }
         if (latest && ["queued", "running"].includes(latest.status)) {
           void pollRun(latest.id, selectedId).catch((reason) =>
             setError(reason instanceof Error ? reason.message : String(reason)),
@@ -590,9 +613,11 @@ export default function App() {
         if (!mountedRef.current) return;
         const result = await api.run(runId);
         const auditResult = await api.audit(agentId);
+        const workflowResult = await api.workflow(runId);
         if (selectedIdRef.current === agentId) {
           setActiveRun(result.run);
           setAudit(auditResult.audit);
+          setWorkflow(workflowResult.workflow);
         }
         if (!["queued", "running"].includes(result.run.status)) {
           await Promise.all([refreshMessages(agentId), refreshAgents()]);
