@@ -4,6 +4,7 @@ import { isArkConfigured } from "./config.js";
 import { startEgressProxy, type EgressProxy } from "./egress-proxy.js";
 import { HttpError, RunCancelledError } from "./errors.js";
 import type { MockResourceService } from "./mock-resource-service.js";
+import type { IntentPlanner } from "./intent-planner.js";
 import { JsonStore } from "./store.js";
 import type {
   Agent,
@@ -11,6 +12,7 @@ import type {
   AgentRunner,
   Audit,
   CreateAgentInput,
+  IntentPlan,
   Message,
   Principal,
   RunnerRequest,
@@ -48,6 +50,7 @@ export class AgentService {
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
     private readonly mockResourceService: MockResourceService,
+    private readonly intentPlanner: IntentPlanner,
   ) {}
 
   async initialize(): Promise<void> {
@@ -94,13 +97,19 @@ export class AgentService {
     const timestamp = now();
     const id = randomUUID();
     const ownerId = principal.userId ?? "default";
+    const scopes =
+      input.scopes && input.scopes.length > 0
+        ? [...new Set(input.scopes)]
+        : [`read:secrets:${ownerId}`, "act:deploy:dev"];
     const agent: Agent = {
       id,
       name: input.name.trim(),
-      description: input.description?.trim() ?? "",
+      description: input.description?.trim() || input.intent?.trim() || "",
       instructions: input.instructions?.trim() ?? "",
       status: "ready",
       ownerId,
+      scopes,
+      plan: input.plan ?? null,
       workspacePath: this.workspaces.workspacePath(id),
       codexThreadId: null,
       lastError: null,
@@ -109,8 +118,38 @@ export class AgentService {
     };
     await this.workspaces.create(agent);
     await this.store.mutate((database) => database.agents.push(agent));
-    await this.audit(principal, agent.id, "create", `agent:${agent.id}`, "allow", "owner");
+    await this.audit(
+      principal,
+      agent.id,
+      "create",
+      `agent:${agent.id}`,
+      "allow",
+      `owner; scopes: ${scopes.join(", ")}`,
+    );
     return agent;
+  }
+
+  /**
+   * Intent-bound permissions planning: ask the planner for the minimum scopes
+   * the stated intent needs, classify them (baseline/elevated/unknown), and
+   * audit the proposal. The UI then asks the user to approve the elevated
+   * subset before createAgent stores the approved scopes on the Agent.
+   */
+  async planIntent(
+    intent: string,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<IntentPlan> {
+    const ownerId = principal.userId ?? "default";
+    const plan = await this.intentPlanner.plan(intent, ownerId);
+    await this.audit(
+      principal,
+      null,
+      "plan",
+      `intent:${intent.slice(0, 80)}`,
+      "allow",
+      `requested [${plan.requestedScopes.join(", ")}] baseline ${plan.baselineScopes.length} elevated ${plan.elevatedScopes.length} unknown ${plan.unknownScopes.length}; source ${plan.source}`,
+    );
+    return plan;
   }
 
   async updateAgent(
@@ -274,6 +313,37 @@ export class AgentService {
     return { revoked };
   }
 
+  /**
+   * Per-scope revocation: remove a single scope from the agent's stored set.
+   * Affects future runs (the active run's credential was minted at start);
+   * the next run's credential won't include the removed scope → the relay 403s it.
+   */
+  async removeScope(
+    agentId: string,
+    scope: string,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<Agent> {
+    this.getAgent(agentId, principal);
+    const updated = await this.store.mutate((database) => {
+      const agent = database.agents.find((item) => item.id === agentId);
+      if (!agent) {
+        throw new HttpError(404, "Agent not found");
+      }
+      agent.scopes = agent.scopes.filter((entry) => entry !== scope);
+      agent.updatedAt = now();
+      return structuredClone(agent);
+    });
+    await this.audit(
+      principal,
+      agentId,
+      "revoke-scope",
+      `scope:${scope}`,
+      "allow",
+      `owner; removed ${scope}`,
+    );
+    return updated;
+  }
+
   listAudit(
     agentId: string | undefined,
     principal: Principal = defaultPrincipal(),
@@ -321,7 +391,7 @@ export class AgentService {
           agentAtStart.id,
           run.id,
           agentAtStart.ownerId,
-          [`read:secrets:${agentAtStart.ownerId}`, "act:deploy:dev"],
+          agentAtStart.scopes,
         );
         proxy = await startEgressProxy({
           token: minted.token,

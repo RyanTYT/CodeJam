@@ -7,6 +7,7 @@ import { JsonStore } from "./store.js";
 import { WorkspaceManager } from "./workspace.js";
 import { MockResourceService } from "./mock-resource-service.js";
 import { createMockApp } from "./mock-resource-server.js";
+import { IntentPlanner } from "./intent-planner.js";
 
 const config = loadConfig();
 await writeCodexConfig(config);
@@ -15,7 +16,8 @@ const store = new JsonStore(path.join(config.dataDirectory, "launchpad.json"));
 const workspaces = new WorkspaceManager(config.workspaceRoot);
 const runner = createRunner(config);
 const mockResourceService = new MockResourceService(config, store);
-const service = new AgentService(config, store, workspaces, runner, mockResourceService);
+const intentPlanner = new IntentPlanner(config);
+const service = new AgentService(config, store, workspaces, runner, mockResourceService, intentPlanner);
 await service.initialize();
 
 const app = await createApp(config, service);

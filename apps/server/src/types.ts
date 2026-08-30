@@ -9,6 +9,10 @@ export interface Agent {
   instructions: string;
   status: AgentStatus;
   ownerId: string;
+  /** Intent-bound, approved scopes minted into the agent's Tier 1 credential. */
+  scopes: string[];
+  /** The plan that produced the scopes (requested/baseline/elevated/unknown + justification). Null for legacy agents. */
+  plan: IntentPlan | null;
   workspacePath: string;
   codexThreadId: string | null;
   lastError: string | null;
@@ -104,6 +108,26 @@ export interface Audit {
   reason: string;
 }
 
+/** Risk classification for a scope, used to decide auto-grant vs approval. */
+export type ScopeRisk = "baseline" | "elevated" | "unknown";
+
+/**
+ * Intent-bound permissions plan: the IntentPlanner proposes the minimum scopes
+ * for a stated intent; each scope is classified (baseline auto-grant, elevated
+ * needs approval, unknown rejected). The user approves a subset; the approved
+ * scopes are stored on the Agent.
+ */
+export interface IntentPlan {
+  intent: string;
+  requestedScopes: string[];
+  baselineScopes: string[];
+  elevatedScopes: string[];
+  unknownScopes: string[];
+  justification: string;
+  /** "llm" when the model produced the plan, "fallback" when the deterministic planner was used. */
+  source: "llm" | "fallback";
+}
+
 export interface Database {
   version: 2;
   agents: Agent[];
@@ -119,6 +143,12 @@ export interface CreateAgentInput {
   name: string;
   description?: string | undefined;
   instructions?: string | undefined;
+  /** The task that drove the scope plan (stored as part of the agent's context). */
+  intent?: string | undefined;
+  /** Approved scopes (intent-bound). Defaults to read:secrets:<owner> + act:deploy:dev. */
+  scopes?: string[] | undefined;
+  /** The plan that produced the scopes (stored on the agent for the Permissions card). */
+  plan?: IntentPlan | undefined;
 }
 
 export interface UpdateAgentInput {

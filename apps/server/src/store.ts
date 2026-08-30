@@ -35,10 +35,15 @@ function migrate(parsed: Partial<Database>): Database {
   ) {
     throw new Error("Unsupported database format");
   }
-  const agents = parsed.agents.map((agent) => ({
-    ...agent,
-    ownerId: agent.ownerId ?? "default",
-  }));
+  const agents = parsed.agents.map((agent) => {
+    const ownerId = agent.ownerId ?? "default";
+    return {
+      ...agent,
+      ownerId,
+      scopes: agent.scopes ?? [`read:secrets:${ownerId}`, "act:deploy:dev"],
+      plan: agent.plan ?? null,
+    };
+  });
   if (version === CURRENT_VERSION) {
     return {
       version: CURRENT_VERSION,

@@ -18,10 +18,28 @@ declare module "fastify" {
 
 const agentIdParams = z.object({ id: z.string().uuid() });
 const runIdParams = z.object({ id: z.string().uuid() });
+const intentPlanSchema = z.object({
+  intent: z.string(),
+  requestedScopes: z.array(z.string()),
+  baselineScopes: z.array(z.string()),
+  elevatedScopes: z.array(z.string()),
+  unknownScopes: z.array(z.string()),
+  justification: z.string(),
+  source: z.enum(["llm", "fallback"]),
+});
 const createAgentBody = z.object({
   name: z.string().trim().min(1).max(80),
   description: z.string().max(500).optional(),
   instructions: z.string().max(10_000).optional(),
+  intent: z.string().max(10_000).optional(),
+  scopes: z.array(z.string().max(200)).max(32).optional(),
+  plan: intentPlanSchema.optional(),
+});
+const planAgentBody = z.object({
+  intent: z.string().trim().min(1).max(10_000),
+});
+const revokeScopeBody = z.object({
+  scope: z.string().trim().min(1).max(200),
 });
 const updateAgentBody = createAgentBody.partial().refine(
   (value) => Object.keys(value).length > 0,
@@ -117,6 +135,12 @@ export async function createApp(
     return reply.code(201).send({ agent });
   });
 
+  app.post("/api/agents/plan", async (request, reply) => {
+    const body = planAgentBody.parse(request.body);
+    const plan = await service.planIntent(body.intent, request.principal);
+    return reply.code(200).send({ plan });
+  });
+
   app.get("/api/agents/:id", async (request) => {
     const { id } = agentIdParams.parse(request.params);
     return { agent: service.getAgent(id, request.principal) };
@@ -146,6 +170,12 @@ export async function createApp(
   app.post("/api/agents/:id/revoke-credential", async (request) => {
     const { id } = agentIdParams.parse(request.params);
     return service.revokeCredential(id, request.principal);
+  });
+
+  app.post("/api/agents/:id/scopes/revoke", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    const body = revokeScopeBody.parse(request.body);
+    return { agent: await service.removeScope(id, body.scope, request.principal) };
   });
 
   app.get("/api/agents/:id/messages", async (request) => {

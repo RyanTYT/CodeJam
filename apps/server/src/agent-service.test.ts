@@ -6,6 +6,7 @@ import { AgentService, defaultPrincipal } from "./agent-service.js";
 import { loadConfig } from "./config.js";
 import { HttpError } from "./errors.js";
 import { MockResourceService } from "./mock-resource-service.js";
+import { IntentPlanner } from "./intent-planner.js";
 import { JsonStore } from "./store.js";
 import type { AgentRunner, Principal, RunnerRequest, RunnerResult } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
@@ -50,12 +51,14 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
   });
   const store = new JsonStore(path.join(root, "data", "db.json"));
   const mockResourceService = new MockResourceService(config, store);
+  const intentPlanner = new IntentPlanner(config);
   const service = new AgentService(
     config,
     store,
     new WorkspaceManager(path.join(root, "workspaces")),
     runner,
     mockResourceService,
+    intentPlanner,
   );
   await service.initialize();
   return service;
@@ -208,5 +211,52 @@ describe("Bouncer ownership boundary (boundary 2)", () => {
 
     const { run } = await service.sendMessage(agent.id, "hello");
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+  });
+
+  it("plans intent-bound scopes from a stated intent (fallback planner)", async () => {
+    const service = await makeService();
+    const alice = principal("alice");
+    const plan = await service.planIntent(
+      "build a todo app that reads my DB url and deploys to dev",
+      alice,
+    );
+    expect(plan.source).toBe("fallback");
+    expect(plan.baselineScopes).toContain("read:secrets:alice");
+    expect(plan.baselineScopes).toContain("act:deploy:dev");
+    expect(plan.elevatedScopes).toEqual([]);
+    expect(service.listAudit().some((row) => row.action === "plan")).toBe(true);
+  });
+
+  it("stores the approved scopes on the Agent (reduced when an elevated scope is denied)", async () => {
+    const service = await makeService();
+    const alice = principal("alice");
+    const agent = await service.createAgent(
+      {
+        name: "Scoped Coder",
+        intent: "read my DB and deploy to dev",
+        scopes: ["read:secrets:alice"],
+      },
+      alice,
+    );
+    expect(agent.scopes).toEqual(["read:secrets:alice"]);
+  });
+
+  it("removes a single scope per-scope and audits the change", async () => {
+    const service = await makeService();
+    const alice = principal("alice");
+    const agent = await service.createAgent(
+      {
+        name: "Scoped",
+        intent: "read + write + deploy",
+        scopes: ["read:secrets:alice", "write:secrets:alice", "act:deploy:dev"],
+      },
+      alice,
+    );
+    expect(agent.scopes).toHaveLength(3);
+    const updated = await service.removeScope(agent.id, "write:secrets:alice", alice);
+    expect(updated.scopes).toEqual(["read:secrets:alice", "act:deploy:dev"]);
+    expect(
+      service.listAudit(agent.id, alice).some((row) => row.action === "revoke-scope"),
+    ).toBe(true);
   });
 });
