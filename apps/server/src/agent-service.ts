@@ -17,6 +17,7 @@ import type {
   Principal,
   RunnerRequest,
   UpdateAgentInput,
+  WorkflowNode,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 import { calculateAgentRiskProfile } from "./risk-engine.js";
@@ -289,8 +290,28 @@ export class AgentService {
       if (storedAgent.status === "busy") {
         throw new HttpError(409, "This Agent is already running");
       }
+      const riskProfile = database.agentRiskProfiles.find((profile) => profile.agentId === agentId);
+      const orchestratorNode: WorkflowNode = {
+        id: randomUUID(),
+        type: "orchestrator",
+        runId: run.id,
+        status: "running",
+        riskLevel: riskProfile?.agentRiskLevel ?? "low",
+        createdAt: timestamp,
+      };
+      const taskNode: WorkflowNode = {
+        id: randomUUID(),
+        type: "task",
+        parentId: orchestratorNode.id,
+        runId: run.id,
+        agentId: agentId,
+        status: "running",
+        riskLevel: riskProfile?.agentRiskLevel ?? "low",
+        createdAt: timestamp,
+      };
       database.runs.push(run);
       database.messages.push(message);
+      database.workflowNodes.push(orchestratorNode, taskNode);
       const snapshot = structuredClone(storedAgent);
       storedAgent.status = "busy";
       storedAgent.lastError = null;
@@ -349,6 +370,14 @@ export class AgentService {
       `owner; removed ${scope}`,
     );
     return updated;
+  }
+
+  getWorkflow(runId: string, principal: Principal = defaultPrincipal()): WorkflowNode[] {
+    const run = this.getRun(runId, principal);
+    return this.store
+      .snapshot()
+      .workflowNodes.filter((node) => node.runId === run.id)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
   listAudit(

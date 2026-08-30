@@ -200,6 +200,11 @@ export async function createApp(
     return { run: service.getRun(id, request.principal) };
   });
 
+  app.get("/api/runs/:id/workflow", async (request) => {
+    const { id } = runIdParams.parse(request.params);
+    return { workflow: service.getWorkflow(id, request.principal) };
+  });
+
   app.get("/api/audit", async (request) => {
     const query = auditQuery.parse(request.query);
     return { audit: service.listAudit(query.agentId, request.principal) };

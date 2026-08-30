@@ -97,6 +97,18 @@ describe("Agent lifecycle", () => {
     expect(service.getAgent(agent.id).codexThreadId).toBe("fake-thread");
   });
 
+  it("tracks workflow hierarchy and risk snapshots for a run", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "Workflow" });
+    const { run } = await service.sendMessage(agent.id, "run workflow");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    const workflow = service.getWorkflow(run.id);
+    expect(workflow.some((node) => node.type === "orchestrator")).toBe(true);
+    expect(workflow.some((node) => node.type === "task" && node.agentId === agent.id)).toBe(true);
+    expect(workflow.every((node) => node.riskLevel === "low" || node.riskLevel === "medium" || node.riskLevel === "high")).toBe(true);
+  });
+
   it("atomically accepts only one concurrent run per Agent", async () => {
     let finish!: (result: RunnerResult) => void;
     const pending = new Promise<RunnerResult>((resolve) => {
