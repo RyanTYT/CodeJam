@@ -54,6 +54,13 @@ export interface Audit {
   scope: string | null;
   decision: "allow" | "deny";
   reason: string;
+  /** Operation-level risk assessment (Phase 1 enhancement). */
+  operationRiskLevel?: "low" | "medium" | "high";
+  operationRiskScore?: number; // 0-100
+  operationRiskFactors?: string[];
+  /** Workflow hierarchy tracking (Phase 1 enhancement). */
+  nodeId?: string;
+  parentNodeId?: string;
 }
 
 export interface SystemInfo {

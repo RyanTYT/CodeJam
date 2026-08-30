@@ -37,7 +37,7 @@ describe("Codex runner protocol", () => {
     expect(args.slice(-3)).toEqual(["resume", "thread-123", "add tests"]);
   });
 
-  it("extracts the session, final message and usage", () => {
+  it("extracts the session, final message, usage, and progress events", () => {
     const parsed = {
       messages: [] as string[],
       threadId: null as string | null,
@@ -47,9 +47,21 @@ describe("Codex runner protocol", () => {
         outputTokens?: number;
       } | null,
       errors: [] as string[],
+      events: [] as Array<{ type: string; label: string; summary: string; detail?: string }>,
     };
     parseCodexEventLine(
       JSON.stringify({ type: "thread.started", thread_id: "thread-123" }),
+      parsed,
+    );
+    parseCodexEventLine(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "file_edit_call",
+          path: "/workspace/Main.java",
+          summary: "Created a hello world Java class.",
+        },
+      }),
       parsed,
     );
     parseCodexEventLine(
@@ -69,5 +81,15 @@ describe("Codex runner protocol", () => {
     expect(parsed.threadId).toBe("thread-123");
     expect(parsed.messages).toEqual(["Done."]);
     expect(parsed.usage).toEqual({ inputTokens: 10, outputTokens: 4 });
+    expect(parsed.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "file_edit_call",
+          label: "File edit",
+          summary: "Created a hello world Java class.",
+          detail: "/workspace/Main.java",
+        }),
+      ]),
+    );
   });
 });

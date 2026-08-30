@@ -264,6 +264,7 @@ export class AgentService {
       output: null,
       error: null,
       usage: null,
+      progress: [],
       startedAt: null,
       completedAt: null,
       createdAt: timestamp,
@@ -577,6 +578,17 @@ export class AgentService {
         workspacePath: agentAtStart.workspacePath,
         prompt: run.prompt,
         threadId: agentAtStart.codexThreadId,
+        onProgress: async (event) => {
+          await this.store.mutate((database) => {
+            const storedRun = database.runs.find((item) => item.id === run.id);
+            if (!storedRun) return;
+            storedRun.progress ??= [];
+            const exists = storedRun.progress.some((entry) => entry.id === event.id);
+            if (!exists) {
+              storedRun.progress.push(event);
+            }
+          });
+        },
       };
       if (proxy) {
         request.proxyPort = proxy.port;
@@ -593,6 +605,7 @@ export class AgentService {
         storedRun.status = "completed";
         storedRun.output = result.output;
         storedRun.usage = result.usage;
+        storedRun.progress = [...(storedRun.progress ?? []), ...result.progress];
         storedRun.completedAt = completedAt;
         database.messages.push({
           id: randomUUID(),

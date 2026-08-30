@@ -656,6 +656,40 @@ textarea:focus {
   background: rgba(251, 250, 247, 0.94);
 }
 
+.playground-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.tab-toggle {
+  display: inline-flex;
+  padding: 4px;
+  background: #f0efeb;
+  border: 1px solid #dedbd2;
+  border-radius: 10px;
+  gap: 4px;
+}
+
+.tab-button {
+  border: 0;
+  background: transparent;
+  color: #6a6b64;
+  padding: 7px 11px;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.tab-active {
+  background: #ffffff;
+  color: #2a2d2a;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
 .playground h2 {
   margin: 3px 0 0;
   font-size: 16px;
@@ -687,6 +721,220 @@ textarea:focus {
   background:
     linear-gradient(rgba(255, 255, 255, 0.52), rgba(255, 255, 255, 0.52)),
     radial-gradient(circle at 20% 0, #f1effb, transparent 38%);
+}
+
+.logs-panel {
+  width: 100%;
+  min-height: 100%;
+  padding: 18px 18px 0;
+}
+
+.logs-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.logs-header-row h3 {
+  margin: 6px 0 0;
+  font-size: 20px;
+  letter-spacing: -0.03em;
+}
+
+.logs-count {
+  color: #666860;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.logs-layout {
+  display: grid;
+  grid-template-columns: minmax(240px, 360px) minmax(0, 1fr);
+  gap: 16px;
+  min-height: 0;
+  height: calc(100% - 64px);
+}
+
+.logs-list-pane,
+.log-detail-pane {
+  background: rgba(255, 255, 255, 0.68);
+  border: 1px solid #e2dfd7;
+  border-radius: 14px;
+  padding: 12px;
+  overflow: auto;
+}
+
+.logs-list-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.log-list-item {
+  width: 100%;
+  border: 1px solid transparent;
+  background: #f8f7f4;
+  border-radius: 12px;
+  padding: 10px 12px;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  cursor: pointer;
+  transition: 150ms ease;
+}
+
+.log-list-item:hover {
+  border-color: #d6d0f8;
+  background: #f3f0ff;
+}
+
+.log-list-item-selected {
+  border-color: #8b7ce6;
+  background: #f0edff;
+}
+
+.log-list-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.log-list-item strong {
+  font-size: 12px;
+}
+
+.log-list-item span,
+.log-list-item small {
+  color: #6b6a66;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.log-list-item small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-list-time {
+  font-weight: 600;
+}
+
+.log-detail-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.log-detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.log-detail-header h4 {
+  margin: 6px 0 0;
+  font-size: 22px;
+  letter-spacing: -0.03em;
+}
+
+.log-detail-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 12px;
+  border-radius: 12px;
+  background: #f8f7f4;
+  border: 1px solid #e7e2d9;
+}
+
+.log-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.log-detail-grid div,
+.log-detail-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.log-detail-grid label,
+.log-detail-block label {
+  font-size: 10px;
+  color: #696962;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.log-detail-grid strong {
+  font-size: 12px;
+  word-break: break-word;
+}
+
+.log-detail-block p {
+  margin: 0;
+  color: #3d3d38;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.log-footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid #ece7df;
+  font-weight: 600;
+  color: #6f6d66;
+  font-size: 10px;
+}
+
+.risk-badge {
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.risk-low {
+  background: rgba(79, 199, 130, 0.12);
+  color: #2b7a51;
+}
+
+.risk-medium {
+  background: rgba(255, 189, 89, 0.14);
+  color: #9a6b07;
+}
+
+.risk-high {
+  background: rgba(234, 88, 88, 0.12);
+  color: #a63d3d;
+}
+
+.empty-log-state {
+  padding: 26px 14px;
+  border: 1px dashed #d9d4cc;
+  border-radius: 12px;
+  color: #70706a;
+  font-size: 12px;
+  text-align: center;
+  background: rgba(255, 255, 255, 0.35);
 }
 
 .welcome {
