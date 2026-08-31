@@ -4,6 +4,15 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
 
+# Load .env if present so `npm run poc` picks up ARK_API_KEY / ARK_MODEL /
+# ARK_BASE_URL / REAL_UPSTREAM_SECRET without manual exporting. Existing env
+# vars take precedence (do not override what's already exported).
+if [[ -f "$repo_dir/.env" ]]; then
+  set -a
+  . "$repo_dir/.env"
+  set +a
+fi
+
 runtime_image="${CONTAINER_RUNTIME_IMAGE:-volc-agent-runtime:local}"
 runtime_base_image="${CONTAINER_RUNTIME_BASE_IMAGE:-node:22-bookworm-slim}"
 runtime_apt_mirror="${CONTAINER_APT_MIRROR:-}"
