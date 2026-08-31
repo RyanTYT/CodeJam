@@ -336,3 +336,48 @@ describe("boundary 3 — HTTP routes", () => {
   });
 
 });
+
+describe("user-scope delegation gating (admin grant -> agent access)", () => {
+  it("lets an owner's agent read a secret they were granted, and denies one they weren't", async () => {
+    const { service } = await makeService();
+    // Admin adds a secret; Alice is granted access, Bob is NOT.
+    await service.addSecret("flag", "ACCESS_GRANTED_42", "ACCESS_********_42");
+    await service.grantUserScope("alice", "read:secrets:flag");
+
+    // Alice's agent delegates read:secrets:flag — Alice holds it, so the
+    // credential keeps it -> the relay allows (200).
+    const { token: aliceToken } = await service.mintCredential(
+      "alice-agent",
+      "alice-run",
+      "alice",
+      ["read:secrets:flag"],
+    );
+    const aliceRes = await service.relay("GET", "secrets/flag", undefined, aliceToken);
+    expect(aliceRes.status).toBe(200);
+
+    // Bob's agent delegates the same scope — Bob does NOT hold it, so the
+    // credential is minted WITHOUT it -> the relay denies (403).
+    const { token: bobToken } = await service.mintCredential(
+      "bob-agent",
+      "bob-run",
+      "bob",
+      ["read:secrets:flag"],
+    );
+    const bobRes = await service.relay("GET", "secrets/flag", undefined, bobToken);
+    expect(bobRes.status).toBe(403);
+  });
+
+  it("admin owners bypass the delegation filter (delegate any scope)", async () => {
+    const { service } = await makeService();
+    await service.addSecret("flag", "ACCESS_GRANTED_42", "ACCESS_********_42");
+    const { token, credential } = await service.mintCredential(
+      "admin-agent",
+      "admin-run",
+      "admin",
+      ["read:secrets:flag"],
+    );
+    expect(credential.scopes).toContain("read:secrets:flag");
+    const res = await service.relay("GET", "secrets/flag", undefined, token);
+    expect(res.status).toBe(200);
+  });
+});

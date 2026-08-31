@@ -138,14 +138,27 @@ export class MockResourceService {
     const token = randomBytes(32).toString("base64url");
     const issuedAt = now();
     const expiresAt = new Date(Date.now() + TOKEN_TTL_MS).toISOString();
-    const role = this.store.snapshot().users.find((u) => u.userId === ownerId)?.role ?? "user";
+    const user = this.store.snapshot().users.find((u) => u.userId === ownerId);
+    const role = user?.role ?? "user";
+    // A user can only delegate scopes they themselves hold (admin bypasses).
+    // This is the seam that makes an admin's user-permission grant actually
+    // gate agent access: if the owner lacks `read:secrets:flag`, their agent's
+    // credential is minted WITHOUT it, so the relay 403s it.
+    const userScopes = user?.scopes ?? [];
+    const effectiveScopes =
+      role === "admin"
+        ? scopes
+        : scopes.filter(
+            (scope) =>
+              userScopes.some((granted) => scope === granted || scope.startsWith(granted + "/")),
+          );
     const credential: AgentCredential = {
       tokenHash: hashToken(token),
       agentId,
       runId,
       ownerId,
       role,
-      scopes,
+      scopes: effectiveScopes,
       issuedAt,
       expiresAt,
       revokedAt: null,
