@@ -252,9 +252,6 @@ export interface WorkflowNode {
   parentNodeId?: string;
 }
 
-/** Risk level classification (Phase 1 enhancement). */
-export type RiskLevel = "low" | "medium" | "high";
-
 /**
  * Agent-level risk profile: computed from scope capabilities and audit history.
  * Captures the overall risk an agent poses based on its declared scopes and

@@ -24,7 +24,6 @@ import type {
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 import { calculateAgentRiskProfile } from "./risk-engine.js";
-import { calculateAgentRiskProfile } from "./risk-engine.js";
 
 const now = () => new Date().toISOString();
 
@@ -642,7 +641,7 @@ export class AgentService {
         storedRun.status = "completed";
         storedRun.output = result.output;
         storedRun.usage = result.usage;
-        storedRun.progress = [...(storedRun.progress ?? []), ...result.progress];
+        storedRun.progress = [...(storedRun.progress ?? []), ...(result.progress ?? [])];
         storedRun.completedAt = completedAt;
         database.messages.push({
           id: randomUUID(),
