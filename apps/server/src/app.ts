@@ -42,18 +42,11 @@ const revokeScopeBody = z.object({
   scope: z.string().trim().min(1).max(200),
 });
 const secretBody = z.object({
-  owner: z
-    .string()
-    .trim()
-    .min(1)
-    .max(60)
-    .regex(/^[a-zA-Z0-9_-]+$/, "owner must be URL-safe"),
   key: z.string().trim().min(1).max(120),
   value: z.string().min(1).max(10_000),
   redactedView: z.string().max(200).optional(),
 });
 const revokeSecretBody = z.object({
-  owner: z.string().trim().min(1).max(60),
   key: z.string().trim().min(1).max(120),
 });
 const userBody = z.object({
@@ -64,6 +57,10 @@ const userBody = z.object({
     .max(60)
     .regex(/^[a-zA-Z0-9_-]+$/, "userId must be URL-safe"),
   role: z.enum(["admin", "user"]).default("user"),
+  scopes: z.array(z.string().max(200)).max(32).optional(),
+});
+const userIdParams = z.object({
+  userId: z.string().regex(/^[a-zA-Z0-9_-]+$/, "userId must be URL-safe"),
 });
 const updateAgentBody = createAgentBody.partial().refine(
   (value) => Object.keys(value).length > 0,
@@ -233,7 +230,6 @@ export async function createApp(
   app.post("/api/secrets", async (request, reply) => {
     const body = secretBody.parse(request.body);
     const secret = await service.addSecret(
-      body.owner,
       body.key,
       body.value,
       body.redactedView,
@@ -244,7 +240,7 @@ export async function createApp(
 
   app.post("/api/secrets/revoke", async (request) => {
     const body = revokeSecretBody.parse(request.body);
-    return service.deleteSecret(body.owner, body.key, request.principal);
+    return service.deleteSecret(body.key, request.principal);
   });
 
   app.get("/api/me", async (request) => {
@@ -259,8 +255,25 @@ export async function createApp(
 
   app.post("/api/users", async (request, reply) => {
     const body = userBody.parse(request.body);
-    const user = await service.addUser(body.userId, body.role, request.principal);
+    const user = await service.addUser(
+      body.userId,
+      body.role,
+      body.scopes ?? [],
+      request.principal,
+    );
     return reply.code(201).send({ user });
+  });
+
+  app.post("/api/users/:userId/scopes/grant", async (request) => {
+    const { userId } = userIdParams.parse(request.params);
+    const body = revokeScopeBody.parse(request.body);
+    return { user: await service.grantUserScope(userId, body.scope, request.principal) };
+  });
+
+  app.post("/api/users/:userId/scopes/revoke", async (request) => {
+    const { userId } = userIdParams.parse(request.params);
+    const body = revokeScopeBody.parse(request.body);
+    return { user: await service.revokeUserScope(userId, body.scope, request.principal) };
   });
 
   if (config.nodeEnv === "production") {

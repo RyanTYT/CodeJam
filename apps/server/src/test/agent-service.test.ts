@@ -230,7 +230,7 @@ describe("Bouncer ownership boundary (boundary 2)", () => {
       alice,
     );
     expect(plan.source).toBe("fallback");
-    expect(plan.baselineScopes).toContain("read:secrets:alice/db-url");
+    expect(plan.baselineScopes).toContain("read:secrets:dev-db-url");
     expect(plan.baselineScopes).toContain("act:deploy:dev");
     expect(plan.elevatedScopes).toEqual([]);
     expect(service.listAudit().some((row) => row.action === "plan")).toBe(true);
@@ -267,5 +267,71 @@ describe("Bouncer ownership boundary (boundary 2)", () => {
     expect(
       service.listAudit(agent.id, alice).some((row) => row.action === "revoke-scope"),
     ).toBe(true);
+  });
+});
+
+describe("User permission management (inherent scopes)", () => {
+  it("adds a user with inherited scopes (admin)", async () => {
+    const service = await makeService();
+    const admin = service.resolvePrincipal("admin");
+    if (!admin) throw new Error("seed admin missing");
+    const user = await service.addUser(
+      "carol",
+      "user",
+      ["act:deploy:dev", "read:secrets:dev-db-url"],
+      admin,
+    );
+    expect(user.userId).toBe("carol");
+    expect(user.scopes).toEqual(["act:deploy:dev", "read:secrets:dev-db-url"]);
+    expect(
+      service.listUsers().find((u) => u.userId === "carol")?.scopes,
+    ).toContain("act:deploy:dev");
+  });
+
+  it("grants a scope to a user and audits the grant (admin)", async () => {
+    const service = await makeService();
+    const admin = service.resolvePrincipal("admin");
+    if (!admin) throw new Error("seed admin missing");
+    const user = await service.grantUserScope("alice", "act:deploy:prod", admin);
+    expect(user.scopes).toContain("act:deploy:prod");
+    expect(
+      service.listUsers().find((u) => u.userId === "alice")?.scopes,
+    ).toContain("act:deploy:prod");
+    expect(service.listAudit().some((row) => row.action === "grant-scope")).toBe(true);
+  });
+
+  it("revokes a scope from a user and audits the revoke (admin)", async () => {
+    const service = await makeService();
+    const admin = service.resolvePrincipal("admin");
+    if (!admin) throw new Error("seed admin missing");
+    const user = await service.revokeUserScope("alice", "act:deploy:dev", admin);
+    expect(user.scopes).not.toContain("act:deploy:dev");
+    expect(
+      service.listUsers().find((u) => u.userId === "alice")?.scopes,
+    ).not.toContain("act:deploy:dev");
+    expect(
+      service.listAudit().some((row) => row.action === "revoke-user-scope"),
+    ).toBe(true);
+  });
+
+  it("denies grant/revoke/add for a non-admin principal (403)", async () => {
+    const service = await makeService();
+    const alice = principal("alice");
+    await expect(
+      service.grantUserScope("bob", "act:deploy:dev", alice),
+    ).rejects.toThrow(/Only admins/);
+    await expect(
+      service.revokeUserScope("bob", "act:deploy:dev", alice),
+    ).rejects.toThrow(/Only admins/);
+    await expect(service.addUser("eve", "user", [], alice)).rejects.toThrow(/Only admins/);
+  });
+
+  it("returns 404 when granting to an unknown user (admin)", async () => {
+    const service = await makeService();
+    const admin = service.resolvePrincipal("admin");
+    if (!admin) throw new Error("seed admin missing");
+    await expect(
+      service.grantUserScope("nobody", "act:deploy:dev", admin),
+    ).rejects.toThrow(/User not found/);
   });
 });

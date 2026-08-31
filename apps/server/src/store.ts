@@ -39,31 +39,10 @@ function migrate(parsed: Partial<Database>): Database {
   const agents = parsed.agents.map((agent) => {
     const ownerId = agent.ownerId ?? "default";
     const baseScopes = agent.scopes ?? [`read:secrets:${ownerId}`, "act:deploy:dev"];
-    // Expand legacy owner-scoped scopes (read:secrets:alice) into per-key
-    // scopes (read:secrets:alice/<key>) for each of that owner's secrets, so
-    // the per-key permission map + revoke operate on real granted scopes.
-    const expanded: string[] = [];
-    for (const scope of baseScopes) {
-      const match = scope.match(/^(read|write):secrets:([^/]+)$/);
-      const verb = match?.[1];
-      const scopeOwner = match?.[2];
-      if (verb && scopeOwner) {
-        const keys = (parsed.mockResources ?? [])
-          .filter((resource) => resource.owner === scopeOwner)
-          .map((resource) => resource.key);
-        if (keys.length > 0) {
-          for (const key of keys) {
-            expanded.push(`${verb}:secrets:${scopeOwner}/${key}`);
-          }
-          continue;
-        }
-      }
-      expanded.push(scope);
-    }
     return {
       ...agent,
       ownerId,
-      scopes: [...new Set(expanded)],
+      scopes: [...new Set(baseScopes)],
       plan: agent.plan ?? null,
     };
   });
@@ -74,10 +53,24 @@ function migrate(parsed: Partial<Database>): Database {
       messages: parsed.messages ?? [],
       runs: parsed.runs ?? [],
       credentials: parsed.credentials ?? [],
-      mockResources: parsed.mockResources ?? [],
+      mockResources: (parsed.mockResources ?? []).map((resource) => {
+        const legacy = resource as { owner?: unknown; key?: unknown };
+        const owner = typeof legacy.owner === "string" ? legacy.owner : "";
+        const key = typeof legacy.key === "string" ? legacy.key : "";
+        return {
+          key: owner.length > 0 ? `${owner}/${key}` : key,
+          value: resource.value,
+          redactedView: resource.redactedView,
+        };
+      }),
       deployStates: parsed.deployStates ?? [],
       audit: parsed.audit ?? [],
-      users: parsed.users ?? [],
+      // Normalize legacy users that predate the per-user `scopes` field so the
+      // User type (scopes: string[]) always holds an array at runtime.
+      users: (parsed.users ?? []).map((user) => ({
+        ...user,
+        scopes: Array.isArray(user.scopes) ? user.scopes : [],
+      })),
     };
   }
   return {

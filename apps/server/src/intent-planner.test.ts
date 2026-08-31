@@ -3,25 +3,25 @@ import { loadConfig } from "./config.js";
 import { classifyScope, IntentPlanner } from "./intent-planner.js";
 
 describe("classifyScope", () => {
-  it("treats own read as baseline and cross-user read as elevated", () => {
-    expect(classifyScope("read:secrets:alice", "alice")).toBe("baseline");
-    expect(classifyScope("read:secrets:bob", "alice")).toBe("elevated");
+  it("treats any read of a centralized secret as baseline", () => {
+    expect(classifyScope("read:secrets:dev-db-url")).toBe("baseline");
+    expect(classifyScope("read:secrets:prod-db-url")).toBe("baseline");
   });
 
   it("treats any write as elevated", () => {
-    expect(classifyScope("write:secrets:alice", "alice")).toBe("elevated");
-    expect(classifyScope("write:secrets:bob", "alice")).toBe("elevated");
+    expect(classifyScope("write:secrets:dev-db-url")).toBe("elevated");
+    expect(classifyScope("write:secrets:prod-db-url")).toBe("elevated");
   });
 
   it("treats deploy:dev as baseline and deploy:prod as elevated", () => {
-    expect(classifyScope("act:deploy:dev", "alice")).toBe("baseline");
-    expect(classifyScope("act:deploy:prod", "alice")).toBe("elevated");
+    expect(classifyScope("act:deploy:dev")).toBe("baseline");
+    expect(classifyScope("act:deploy:prod")).toBe("elevated");
   });
 
   it("rejects unknown scopes", () => {
-    expect(classifyScope("admin:system", "alice")).toBe("unknown");
-    expect(classifyScope("read:secrets", "alice")).toBe("unknown");
-    expect(classifyScope("act:deploy:staging", "alice")).toBe("unknown");
+    expect(classifyScope("admin:system")).toBe("unknown");
+    expect(classifyScope("read:secrets")).toBe("unknown");
+    expect(classifyScope("act:deploy:staging")).toBe("unknown");
   });
 });
 
@@ -31,11 +31,10 @@ describe("IntentPlanner (fallback — Ark is not configured in tests)", () => {
   it("derives read + deploy:dev (both baseline) for a benign build intent", async () => {
     const plan = await planner.plan(
       "build a todo app that reads my DB url and deploys to dev",
-      "alice",
-      ["db-url"],
+      ["dev-db-url", "prod-db-url", "api-token"],
     );
     expect(plan.source).toBe("fallback");
-    expect(plan.baselineScopes).toContain("read:secrets:alice/db-url");
+    expect(plan.baselineScopes).toContain("read:secrets:dev-db-url");
     expect(plan.baselineScopes).toContain("act:deploy:dev");
     expect(plan.elevatedScopes).toEqual([]);
     expect(plan.unknownScopes).toEqual([]);
@@ -44,23 +43,22 @@ describe("IntentPlanner (fallback — Ark is not configured in tests)", () => {
   it("flags write + deploy:prod as elevated for a prod intent", async () => {
     const plan = await planner.plan(
       "migrate the prod DB and deploy to prod",
-      "alice",
-      ["db-url"],
+      ["dev-db-url", "prod-db-url", "api-token"],
     );
-    expect(plan.elevatedScopes).toContain("write:secrets:alice/db-url");
+    expect(plan.elevatedScopes).toContain("write:secrets:prod-db-url");
     expect(plan.elevatedScopes).toContain("act:deploy:prod");
   });
 
-  it("defaults to read own secrets when no keyword matches", async () => {
-    const plan = await planner.plan("hello world", "alice");
-    expect(plan.requestedScopes).toContain("read:secrets:alice");
+  it("defaults to reading the first secret when no keyword matches", async () => {
+    const plan = await planner.plan("hello world", ["dev-db-url", "prod-db-url"]);
+    expect(plan.requestedScopes).toContain("read:secrets:dev-db-url");
   });
 
   it("never grants a scope the taxonomy doesn't know", async () => {
-    const plan = await planner.plan("do something benign", "alice");
+    const plan = await planner.plan("do something benign", ["dev-db-url"]);
     expect(plan.unknownScopes).toEqual([]);
     for (const scope of plan.requestedScopes) {
-      expect(classifyScope(scope, "alice")).not.toBe("unknown");
+      expect(classifyScope(scope)).not.toBe("unknown");
     }
   });
 });

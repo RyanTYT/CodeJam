@@ -38,22 +38,19 @@ export interface UpstreamResult {
 
 const SEED_RESOURCES: MockResource[] = [
   {
-    owner: "alice",
-    key: "db-url",
-    value: "postgres://alice:s3cret@db.alice.local/agentdb",
-    redactedView: "postgres://***:***@db.alice.local/agentdb",
+    key: "dev-db-url",
+    value: "postgres://dev:s3cret@db.dev.local/agentdb",
+    redactedView: "postgres://***:***@db.dev.local/agentdb",
   },
   {
-    owner: "bob",
-    key: "db-url",
-    value: "postgres://bob:p4ssw0rd@db.bob.local/agentdb",
-    redactedView: "postgres://***:***@db.bob.local/agentdb",
-  },
-  {
-    owner: "prod",
-    key: "db-url",
+    key: "prod-db-url",
     value: "postgres://prod:pr0d-secret@db.prod.local/agentdb",
     redactedView: "postgres://***:***@db.prod.local/agentdb",
+  },
+  {
+    key: "api-token",
+    value: "sk-dev-9f3e2a8c4b1d7e0f6a5c3b2d1e0f9a8b",
+    redactedView: "sk-dev-************************",
   },
 ];
 
@@ -107,11 +104,26 @@ export class MockResourceService {
       }
       if (db.users.length === 0) {
         const timestamp = now();
+        // Seed each user with a baseline inherent scope so the admin panel
+        // shows a non-empty permission->user matrix out of the box. Admins
+        // bypass the capability check regardless of their scopes field.
         db.users.push(
-          { id: randomUUID(), userId: "admin", role: "admin", createdAt: timestamp },
-          { id: randomUUID(), userId: "default", role: "user", createdAt: timestamp },
-          { id: randomUUID(), userId: "alice", role: "user", createdAt: timestamp },
-          { id: randomUUID(), userId: "bob", role: "user", createdAt: timestamp },
+          { id: randomUUID(), userId: "admin", role: "admin", scopes: [], createdAt: timestamp },
+          { id: randomUUID(), userId: "default", role: "user", scopes: [], createdAt: timestamp },
+          {
+            id: randomUUID(),
+            userId: "alice",
+            role: "user",
+            scopes: ["read:secrets:dev-db-url", "act:deploy:dev"],
+            createdAt: timestamp,
+          },
+          {
+            id: randomUUID(),
+            userId: "bob",
+            role: "user",
+            scopes: ["read:secrets:prod-db-url"],
+            createdAt: timestamp,
+          },
         );
       }
     });
@@ -175,7 +187,6 @@ export class MockResourceService {
    * that decrypts (for the Tier-2 upstream gate).
    */
   async addSecret(
-    owner: string,
     key: string,
     value: string,
     redactedView: string | undefined,
@@ -183,46 +194,35 @@ export class MockResourceService {
     const view = redactedView?.trim() || "•••••••• (redacted)";
     const encrypted = encrypt(value, this.config.secretsKey);
     await this.store.mutate((db) => {
-      const existing = db.mockResources.find(
-        (resource) => resource.owner === owner && resource.key === key,
-      );
+      const existing = db.mockResources.find((resource) => resource.key === key);
       if (existing) {
         existing.value = encrypted;
         existing.redactedView = view;
       } else {
-        db.mockResources.push({ owner, key, value: encrypted, redactedView: view });
+        db.mockResources.push({ key, value: encrypted, redactedView: view });
       }
     });
-    return { owner, key, redactedView: view };
+    return { key, redactedView: view };
   }
 
-  /** List the owner's secrets — redacted views only, never the values. */
-  listSecrets(owner: string): Secret[] {
-    return this.store
-      .snapshot()
-      .mockResources.filter((resource) => resource.owner === owner)
-      .map((resource) => ({
-        owner: resource.owner,
-        key: resource.key,
-        redactedView: resource.redactedView,
-      }));
+  /** List all centralized secrets — redacted views only, never the values. */
+  listSecrets(): Secret[] {
+    return this.store.snapshot().mockResources.map((resource) => ({
+      key: resource.key,
+      redactedView: resource.redactedView,
+    }));
   }
 
   /** Just the secret keys — for the IntentPlanner's per-key taxonomy. */
-  listSecretKeys(owner: string): string[] {
-    return this.store
-      .snapshot()
-      .mockResources.filter((resource) => resource.owner === owner)
-      .map((resource) => resource.key);
+  listSecretKeys(): string[] {
+    return this.store.snapshot().mockResources.map((resource) => resource.key);
   }
 
-  async deleteSecret(owner: string, key: string): Promise<boolean> {
+  async deleteSecret(key: string): Promise<boolean> {
     let removed = false;
     await this.store.mutate((db) => {
       const before = db.mockResources.length;
-      db.mockResources = db.mockResources.filter(
-        (resource) => !(resource.owner === owner && resource.key === key),
-      );
+      db.mockResources = db.mockResources.filter((resource) => resource.key !== key);
       removed = db.mockResources.length < before;
     });
     return removed;
@@ -239,18 +239,49 @@ export class MockResourceService {
     );
   }
 
-  async addUser(userId: string, role: "admin" | "user"): Promise<User> {
-    const user: User = { id: randomUUID(), userId, role, createdAt: now() };
+  async addUser(
+    userId: string,
+    role: "admin" | "user",
+    scopes: readonly string[] = [],
+  ): Promise<User> {
+    const user: User = {
+      id: randomUUID(),
+      userId,
+      role,
+      scopes: [...new Set(scopes)],
+      createdAt: now(),
+    };
     await this.store.mutate((db) => {
       db.users.push(user);
     });
     return user;
   }
 
+  /** Grant an inherent scope to a user (admin-managed). Returns the updated
+   *  user, or null if the user does not exist. Idempotent. */
+  async grantUserScope(userId: string, scope: string): Promise<User | null> {
+    return this.store.mutate((db) => {
+      const user = db.users.find((entry) => entry.userId === userId);
+      if (!user) return null;
+      if (!user.scopes.includes(scope)) user.scopes.push(scope);
+      return structuredClone(user);
+    });
+  }
+
+  /** Revoke an inherent scope from a user (admin-managed). Returns the updated
+   *  user, or null if the user does not exist. Idempotent. */
+  async revokeUserScope(userId: string, scope: string): Promise<User | null> {
+    return this.store.mutate((db) => {
+      const user = db.users.find((entry) => entry.userId === userId);
+      if (!user) return null;
+      user.scopes = user.scopes.filter((entry) => entry !== scope);
+      return structuredClone(user);
+    });
+  }
+
   /** All secrets across all owners (admin view) — redacted views only. */
   listAllSecrets(): Secret[] {
     return this.store.snapshot().mockResources.map((resource) => ({
-      owner: resource.owner,
       key: resource.key,
       redactedView: resource.redactedView,
     }));
@@ -264,27 +295,31 @@ export class MockResourceService {
   deriveScope(method: string, path: string): DerivedScope | null {
     const parts = path.split("/").filter(Boolean);
     const kind = parts[0];
-    const owner = parts[1];
-    if (!kind || !owner) return null;
+    if (!kind) return null;
     if (kind === "secrets") {
+      // Centralized: the entire path after `secrets/` is the key (may itself
+      // contain `/` for legacy composite keys like `alice/db-url`).
+      const key = parts.slice(1).join("/");
+      if (!key) return null;
       const verb: DerivedScope["verb"] =
         method === "GET" || method === "HEAD" ? "read" : "write";
-      const key = parts.slice(2).join("/");
       return {
         kind,
-        owner,
+        owner: key,
         verb,
-        scope: key ? `${verb}:secrets:${owner}/${key}` : `${verb}:secrets:${owner}`,
-        resource: key ? `secrets:${owner}/${key}` : `secrets:${owner}`,
+        scope: `${verb}:secrets:${key}`,
+        resource: `secrets:${key}`,
       };
     }
     if (kind === "deploy") {
+      const env = parts.slice(1).join("/");
+      if (!env) return null;
       return {
         kind,
-        owner,
+        owner: env,
         verb: "act",
-        scope: `act:deploy:${owner}`,
-        resource: `deploy:${owner}`,
+        scope: `act:deploy:${env}`,
+        resource: `deploy:${env}`,
       };
     }
     return null;
@@ -414,18 +449,17 @@ export class MockResourceService {
   ): Promise<UpstreamResult> {
     const parts = path.split("/").filter(Boolean);
     const kind = parts[0];
-    const target = parts[1];
+    const target = parts.slice(1).join("/");
     if (!kind || !target) {
       return { status: 404, body: { error: "unknown resource" } };
     }
 
     if (kind === "secrets") {
-      const key = parts.slice(2).join("/");
-      if (!key) return { status: 400, body: { error: "missing key" } };
+      const key = target;
       if (method === "GET" || method === "HEAD") {
         const resource = this.store
           .snapshot()
-          .mockResources.find((entry) => entry.owner === target && entry.key === key);
+          .mockResources.find((entry) => entry.key === key);
         if (!resource) return { status: 404, body: { error: "not found" } };
         return {
           status: 200,
@@ -439,7 +473,7 @@ export class MockResourceService {
         let updated = false;
         await this.store.mutate((db) => {
           const entry = db.mockResources.find(
-            (resource) => resource.owner === target && resource.key === key,
+            (resource) => resource.key === key,
           );
           if (entry) {
             entry.value = encrypt(
@@ -480,7 +514,7 @@ export class MockResourceService {
     if (upstream.status >= 400) return upstream.body;
     if (scope.kind === "secrets" && scope.verb === "read" && upstream.status === 200) {
       const resource = upstream.body as MockResource;
-      return { owner: resource.owner, key: resource.key, value: resource.redactedView };
+      return { key: resource.key, value: resource.redactedView };
     }
     return upstream.body;
   }

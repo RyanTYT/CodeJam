@@ -143,8 +143,8 @@ export class AgentService {
     principal: Principal = defaultPrincipal(),
   ): Promise<IntentPlan> {
     const ownerId = principal.userId ?? "default";
-    const secretKeys = this.mockResourceService.listSecretKeys(ownerId);
-    const plan = await this.intentPlanner.plan(intent, ownerId, secretKeys);
+    const secretKeys = this.mockResourceService.listSecretKeys();
+    const plan = await this.intentPlanner.plan(intent, secretKeys);
     await this.audit(
       principal,
       null,
@@ -356,17 +356,14 @@ export class AgentService {
     return this.mockResourceService.listAudit(agentId);
   }
 
-  /** Vault — owner-managed key:value secrets (encrypted at rest, redacted views only). */
+  /** Vault — centralized secrets (encrypted at rest, redacted views only).
+   *  Everyone sees the redacted catalog; only admins may add/delete. */
   listSecrets(principal: Principal = defaultPrincipal()): Secret[] {
-    if (principal.role === "admin") {
-      return this.mockResourceService.listAllSecrets();
-    }
-    const ownerId = principal.userId ?? "default";
-    return this.mockResourceService.listSecrets(ownerId);
+    void principal;
+    return this.mockResourceService.listSecrets();
   }
 
   async addSecret(
-    owner: string,
     key: string,
     value: string,
     redactedView: string | undefined,
@@ -375,25 +372,24 @@ export class AgentService {
     if (principal.role !== "admin") {
       throw new HttpError(403, "Only admins may manage secrets");
     }
-    const secret = await this.mockResourceService.addSecret(owner, key, value, redactedView);
-    await this.audit(principal, null, "add-secret", `secret:${owner}/${key}`, "allow", "admin");
+    const secret = await this.mockResourceService.addSecret(key, value, redactedView);
+    await this.audit(principal, null, "add-secret", `secret:${key}`, "allow", "admin");
     return secret;
   }
 
   async deleteSecret(
-    owner: string,
     key: string,
     principal: Principal = defaultPrincipal(),
   ): Promise<{ deleted: boolean }> {
     if (principal.role !== "admin") {
       throw new HttpError(403, "Only admins may manage secrets");
     }
-    const deleted = await this.mockResourceService.deleteSecret(owner, key);
+    const deleted = await this.mockResourceService.deleteSecret(key);
     await this.audit(
       principal,
       null,
       "revoke-secret",
-      `secret:${owner}/${key}`,
+      `secret:${key}`,
       deleted ? "allow" : "deny",
       deleted ? "admin" : "not found",
     );
@@ -422,6 +418,7 @@ export class AgentService {
   async addUser(
     userId: string,
     role: "admin" | "user",
+    scopes: readonly string[] = [],
     principal: Principal = defaultPrincipal(),
   ): Promise<User> {
     if (principal.role !== "admin") {
@@ -430,8 +427,63 @@ export class AgentService {
     if (this.mockResourceService.resolveUser(userId)) {
       throw new HttpError(409, `User ${userId} already exists`);
     }
-    const user = await this.mockResourceService.addUser(userId, role);
-    await this.audit(principal, null, "add-user", `user:${userId}`, "allow", `admin; role ${role}`);
+    const user = await this.mockResourceService.addUser(userId, role, scopes);
+    await this.audit(
+      principal,
+      null,
+      "add-user",
+      `user:${userId}`,
+      "allow",
+      `admin; role ${role}; scopes ${scopes.length}`,
+    );
+    return user;
+  }
+
+  /** Grant an inherent permission to a user (admin-managed + audited). */
+  async grantUserScope(
+    userId: string,
+    scope: string,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<User> {
+    if (principal.role !== "admin") {
+      throw new HttpError(403, "Only admins may manage user permissions");
+    }
+    const user = await this.mockResourceService.grantUserScope(userId, scope);
+    if (!user) {
+      throw new HttpError(404, "User not found");
+    }
+    await this.audit(
+      principal,
+      null,
+      "grant-scope",
+      `user:${userId};scope:${scope}`,
+      "allow",
+      `admin; granted ${scope}`,
+    );
+    return user;
+  }
+
+  /** Revoke an inherent permission from a user (admin-managed + audited). */
+  async revokeUserScope(
+    userId: string,
+    scope: string,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<User> {
+    if (principal.role !== "admin") {
+      throw new HttpError(403, "Only admins may manage user permissions");
+    }
+    const user = await this.mockResourceService.revokeUserScope(userId, scope);
+    if (!user) {
+      throw new HttpError(404, "User not found");
+    }
+    await this.audit(
+      principal,
+      null,
+      "revoke-user-scope",
+      `user:${userId};scope:${scope}`,
+      "allow",
+      `admin; revoked ${scope}`,
+    );
     return user;
   }
 

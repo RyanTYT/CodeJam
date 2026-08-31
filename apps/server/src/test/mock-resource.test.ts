@@ -47,15 +47,15 @@ describe("boundary 3 — relay policy", () => {
   it("allows a scoped read, returns the redacted view, and audits allow", async () => {
     const { service, store } = await makeService();
     const { token } = await service.mintCredential("agent-1", "run-1", "alice", [
-      "read:secrets:alice/db-url",
+      "read:secrets:dev-db-url",
     ]);
 
-    const result = await service.relay("GET", "secrets/alice/db-url", undefined, token);
+    const result = await service.relay("GET", "secrets/dev-db-url", undefined, token);
 
     expect(result.status).toBe(200);
     const resource = store
       .snapshot()
-      .mockResources.find((entry) => entry.owner === "alice");
+      .mockResources.find((entry) => entry.key === "dev-db-url");
     expect(bodyValue(result.body)).toBe(resource?.redactedView);
     expect(bodyValue(result.body)).not.toBe(resource?.value);
     expect(JSON.stringify(result.body)).not.toContain(resource?.value ?? "no-raw");
@@ -69,14 +69,14 @@ describe("boundary 3 — relay policy", () => {
   it("denies a scope mismatch with 403, never reaches upstream, and audits deny", async () => {
     const { service, store } = await makeService();
     const { token } = await service.mintCredential("agent-1", "run-1", "alice", [
-      "read:secrets:alice",
+      "read:secrets:dev-db-url",
     ]);
-    const before = store.snapshot().mockResources.find((entry) => entry.owner === "bob")?.value;
+    const before = store.snapshot().mockResources.find((entry) => entry.key === "prod-db-url")?.value;
 
-    const result = await service.relay("GET", "secrets/bob/db-url", undefined, token);
+    const result = await service.relay("GET", "secrets/prod-db-url", undefined, token);
 
     expect(result.status).toBe(403);
-    expect(store.snapshot().mockResources.find((entry) => entry.owner === "bob")?.value).toBe(
+    expect(store.snapshot().mockResources.find((entry) => entry.key === "prod-db-url")?.value).toBe(
       before,
     );
     const deny = service
@@ -136,13 +136,13 @@ describe("boundary 3 — HTTP routes", () => {
   it("routes /mock/proxy/* through the relay with the proxy-injected token", async () => {
     const { service } = await makeService();
     const { token } = await service.mintCredential("agent-1", "run-1", "alice", [
-      "read:secrets:alice/db-url",
+      "read:secrets:dev-db-url",
     ]);
     const app = await createMockApp(service);
     try {
       const res = await app.inject({
         method: "GET",
-        url: "/mock/proxy/secrets/alice/db-url",
+        url: "/mock/proxy/secrets/dev-db-url",
         headers: { authorization: "Bearer " + token },
       });
       expect(res.statusCode).toBe(200);
@@ -158,13 +158,13 @@ describe("boundary 3 — HTTP routes", () => {
     try {
       const denied = await app.inject({
         method: "GET",
-        url: "/mock/upstream/secrets/alice/db-url",
+        url: "/mock/upstream/secrets/dev-db-url",
       });
       expect(denied.statusCode).toBe(401);
 
       const allowed = await app.inject({
         method: "GET",
-        url: "/mock/upstream/secrets/alice/db-url",
+        url: "/mock/upstream/secrets/dev-db-url",
         headers: { "x-upstream-secret": TIER2 },
       });
       expect(allowed.statusCode).toBe(200);
@@ -176,16 +176,16 @@ describe("boundary 3 — HTTP routes", () => {
   it("never exposes the raw secret via the relay, even on an allowed read", async () => {
     const { service, store } = await makeService();
     const { token } = await service.mintCredential("agent-1", "run-1", "alice", [
-      "read:secrets:alice",
+      "read:secrets:dev-db-url",
     ]);
     const app = await createMockApp(service);
     try {
       const res = await app.inject({
         method: "GET",
-        url: "/mock/proxy/secrets/alice/db-url",
+        url: "/mock/proxy/secrets/dev-db-url",
         headers: { authorization: "Bearer " + token },
       });
-      const raw = store.snapshot().mockResources.find((entry) => entry.owner === "alice")?.value;
+      const raw = store.snapshot().mockResources.find((entry) => entry.key === "dev-db-url")?.value;
       expect(res.rawPayload).not.toContain(raw ?? "no-raw-value");
     } finally {
       await app.close();

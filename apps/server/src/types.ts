@@ -81,26 +81,30 @@ export interface AgentCredential {
   revokedAt: string | null;
 }
 
-/** Tier 2 data — the protected resource. `value` never leaves the server. */
+/** Tier 2 data — a centralized protected secret. `value` never leaves the
+ *  server. Secrets are global resources (not user-owned); per-user access is
+ *  governed by each user's inherent scopes + each agent's credential scopes. */
 export interface MockResource {
-  owner: string;
   key: string;
   value: string;
   redactedView: string;
 }
 
-/** A redacted view of a stored secret — the value never leaves the server. */
+/** A redacted view of a centralized stored secret — the value never leaves
+ *  the server. */
 export interface Secret {
-  owner: string;
   key: string;
   redactedView: string;
 }
 
-/** A registered principal in the central users store. Admins can access all secrets. */
+/** A registered principal in the central users store. Admins can access all secrets.
+ *  `scopes` are the user's INHERENT (human-principal) permissions — the baseline
+ *  authority a user can exercise or delegate to their agents, managed by admins. */
 export interface User {
   id: string;
   userId: string;
   role: "admin" | "user";
+  scopes: string[];
   createdAt: string;
 }
 
