@@ -439,9 +439,9 @@ export class MockResourceService {
       humanPrincipalId: "user:" + credential.ownerId,
       agentId: credential.agentId,
       agentPrincipalId: "agent:" + credential.agentId,
-      planId: "", // TODO: Add planId to audit
-      planHash: "", // TODO: Add planHash to audit
-      capability: "", // TODO: Add capability to audit
+      planId: null,
+      planHash: null,
+      capability: `${requestedCapability.action}:${requestedCapability.resource}:${requestedCapability.scope}`,
       runId: credential.runId,
       method,
       action: scope.verb,
@@ -590,9 +590,11 @@ export class MockResourceService {
       humanPrincipalId: credential ? "user:" + credential.ownerId : "unknown",
       agentId: credential?.agentId ?? null,
       agentPrincipalId: credential ? "agent:" + credential.agentId : null,
-      planId: "", // TODO: add planId to audit
-      planHash: "", // TODO: add planHash to audit
-      capability: "", // TODO: add capability
+      planId: null,
+      planHash: null,
+      capability: derived
+        ? `${derived.verb}:${derived.resource}:${derived.scope}`
+        : null,
       runId: credential?.runId ?? null,
       method,
       action: derived?.verb ?? "unknown",

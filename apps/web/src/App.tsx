@@ -942,7 +942,13 @@ export default function App() {
   const switcherUsers = users.length > 0 ? users.map((u) => u.userId) : ["default"];
 
   return (
-    <div className={"app-shell" + (currentRole === "admin" && activeTab === "logs" ? " app-shell-wide" : "")}>
+    <div
+      className={
+        "app-shell" +
+        (currentRole === "admin" ? " app-shell-admin" : "") +
+        (currentRole === "admin" && activeTab === "logs" ? " app-shell-wide" : "")
+      }
+    >
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">A</div>
