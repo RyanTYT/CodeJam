@@ -276,6 +276,20 @@ export async function createApp(
     return { user: await service.revokeUserScope(userId, body.scope, request.principal) };
   });
 
+  // Debug: mint a Tier-1 credential for a user (admin-only) so the relay
+  // enforcement can be exercised live (curl /mock/proxy/secrets/<key> with the
+  // token) without running an agent. Mirrors a real run's mintCredential gating.
+  app.post("/api/debug/mint-credential", async (request, reply) => {
+    const body = z
+      .object({
+        userId: z.string().regex(/^[a-zA-Z0-9_-]+$/),
+        scopes: z.array(z.string().max(200)).max(32).default([]),
+      })
+      .parse(request.body);
+    const result = await service.mintDebugCredential(body.userId, body.scopes, request.principal);
+    return reply.code(201).send(result);
+  });
+
   if (config.nodeEnv === "production") {
     const webRoot = fileURLToPath(new URL("../../web/dist", import.meta.url));
     await app.register(fastifyStatic, {

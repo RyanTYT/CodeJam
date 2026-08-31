@@ -8,6 +8,7 @@ import type { IntentPlanner } from "./intent-planner.js";
 import { JsonStore } from "./store.js";
 import type {
   Agent,
+  AgentCredential,
   AgentRun,
   AgentRunner,
   Audit,
@@ -485,6 +486,29 @@ export class AgentService {
       `admin; revoked ${scope}`,
     );
     return user;
+  }
+
+  /**
+   * Debug: mint a Tier-1 credential for a user (admin-only). Lets you test the
+   * relay enforcement (boundary 3) live — curl /mock/proxy/secrets/<key> with
+   * the returned token — without running an agent (which needs Ark/Codex).
+   * The credential's scopes are filtered by the owner's inherent User.scopes
+   * (admin bypasses), exactly like a real agent run.
+   */
+  async mintDebugCredential(
+    userId: string,
+    scopes: string[],
+    principal: Principal = defaultPrincipal(),
+  ): Promise<{ token: string; credential: AgentCredential }> {
+    if (principal.role !== "admin") {
+      throw new HttpError(403, "Only admins may mint debug credentials");
+    }
+    return this.mockResourceService.mintCredential(
+      "debug-agent",
+      "debug-run",
+      userId,
+      scopes,
+    );
   }
 
   async systemInfo(): Promise<Record<string, unknown>> {
