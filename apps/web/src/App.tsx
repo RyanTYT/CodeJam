@@ -1455,6 +1455,33 @@ export default function App() {
                   <span className="eyebrow">{agents.length}</span>
                 </div>
 
+                <div className="owner-card">
+                  <div className="owner-scopes-head">
+                    <span className="eyebrow">Your permissions</span>
+                    <span className="eyebrow">{myScopes.length}</span>
+                  </div>
+                  <p className="owner-note" style={{ margin: "0 0 6px" }}>
+                    The permissions you inherit as {currentUser} (granted by an admin).
+                  </p>
+                  <div className="owner-scope-list">
+                    {myScopes.length === 0 ? (
+                      <div className="perm-empty">You have no inherent permissions.</div>
+                    ) : (
+                      myScopes.map((scope) => {
+                        const risk = classifyScopeClient(scope);
+                        return (
+                          <div className="owner-scope" key={scope}>
+                            <span
+                              className={"mini-dot mini-" + (risk === "baseline" ? "ready" : "warning")}
+                            />
+                            <code>{scope}</code>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+
                 {agents.length === 0 ? (
                   <div className="perm-empty">You own no agents yet.</div>
                 ) : (
