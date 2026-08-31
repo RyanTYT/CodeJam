@@ -78,8 +78,9 @@ export interface IntentPlan {
   source: "llm" | "fallback";
 }
 
+/** A redacted view of a centralized stored secret — the value never leaves
+ *  the server. Secrets are global (not user-owned). */
 export interface Secret {
-  owner: string;
   key: string;
   redactedView: string;
 }
@@ -88,5 +89,8 @@ export interface User {
   id: string;
   userId: string;
   role: "admin" | "user";
+  /** Inherent (human-principal) permissions an admin grants; the baseline
+   *  authority a user can exercise or delegate to their agents. */
+  scopes: string[];
   createdAt: string;
 }

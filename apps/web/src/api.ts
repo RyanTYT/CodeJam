@@ -60,21 +60,31 @@ export const api = {
       body: JSON.stringify({ scope }),
     }),
   listSecrets: () => request<{ secrets: Secret[] }>("/api/secrets"),
-  addSecret: (owner: string, key: string, value: string, redactedView: string | undefined) =>
+  addSecret: (key: string, value: string, redactedView: string | undefined) =>
     request<{ secret: Secret }>("/api/secrets", {
       method: "POST",
-      body: JSON.stringify({ owner, key, value, redactedView }),
+      body: JSON.stringify({ key, value, redactedView }),
     }),
-  revokeSecret: (owner: string, key: string) =>
+  revokeSecret: (key: string) =>
     request<{ deleted: boolean }>("/api/secrets/revoke", {
       method: "POST",
-      body: JSON.stringify({ owner, key }),
+      body: JSON.stringify({ key }),
     }),
   listUsers: () => request<{ users: User[] }>("/api/users"),
-  addUser: (userId: string, role: "admin" | "user") =>
+  addUser: (userId: string, role: "admin" | "user", scopes?: string[]) =>
     request<{ user: User }>("/api/users", {
       method: "POST",
-      body: JSON.stringify({ userId, role }),
+      body: JSON.stringify({ userId, role, scopes }),
+    }),
+  grantUserScope: (userId: string, scope: string) =>
+    request<{ user: User }>("/api/users/" + userId + "/scopes/grant", {
+      method: "POST",
+      body: JSON.stringify({ scope }),
+    }),
+  revokeUserScope: (userId: string, scope: string) =>
+    request<{ user: User }>("/api/users/" + userId + "/scopes/revoke", {
+      method: "POST",
+      body: JSON.stringify({ scope }),
     }),
   me: () => request<{ user: { userId: string; role: "admin" | "user" } }>("/api/me"),
   planAgent: (intent: string) =>

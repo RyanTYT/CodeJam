@@ -26,21 +26,13 @@ function formatTime(value: string): string {
 }
 
 /**
- * Client-side mirror of the server's scope taxonomy. Per-key aware:
- * `read:secrets:<owner>/<key>` is baseline when <owner> === the agent's owner,
- * elevated (cross-user) otherwise. Writes are always elevated. The deploy
- * split keeps dev baseline, prod elevated.
+ * Client-side mirror of the server's scope taxonomy for centralized secrets:
+ * any `read:secrets:<key>` is baseline, any write is elevated, deploy dev is
+ * baseline, prod elevated. No own/cross-user axis (secrets are global).
  */
-function classifyScopeClient(
-  scope: string,
-  ownerId: string | undefined,
-): "baseline" | "elevated" | "unknown" {
-  const readMatch = scope.match(/^read:secrets:(.+)$/);
-  if (readMatch && readMatch[1]) {
-    const targetOwner = readMatch[1].split("/")[0];
-    return targetOwner === ownerId ? "baseline" : "elevated";
-  }
-  if (/^write:secrets:/.test(scope)) return "elevated";
+function classifyScopeClient(scope: string): "baseline" | "elevated" | "unknown" {
+  if (/^read:secrets:.+/.test(scope)) return "baseline";
+  if (/^write:secrets:.+/.test(scope)) return "elevated";
   if (scope === "act:deploy:dev") return "baseline";
   if (scope === "act:deploy:prod") return "elevated";
   return "unknown";
@@ -57,6 +49,30 @@ function scopeCovers(granted: string, cell: string): boolean {
 
 function isGranted(scopes: string[], cell: string): boolean {
   return scopes.some((granted) => scopeCovers(granted, cell));
+}
+
+/** Does a user have access to a permission? Admins bypass; otherwise any
+ *  granted scope that covers the permission (exact or a coarser owner scope)
+ *  counts. */
+function userHasPermission(user: User, scope: string): boolean {
+  if (user.role === "admin") return true;
+  return user.scopes.some((granted) => scopeCovers(granted, scope));
+}
+
+type UserPermissionStatus =
+  | { kind: "admin" }
+  | { kind: "granted" }
+  | { kind: "via"; via: string }
+  | { kind: "none" };
+
+/** How a user holds a permission: admin bypass, exact grant, inherited via a
+ *  broader granted scope, or not at all. Drives the admin detail toggles. */
+function userPermissionStatus(user: User, scope: string): UserPermissionStatus {
+  if (user.role === "admin") return { kind: "admin" };
+  if (user.scopes.includes(scope)) return { kind: "granted" };
+  const broader = user.scopes.find((granted) => granted !== scope && scopeCovers(granted, scope));
+  if (broader) return { kind: "via", via: broader };
+  return { kind: "none" };
 }
 
 function StatusPill({ status }: { status: Agent["status"] }) {
@@ -97,7 +113,6 @@ export default function App() {
   const [secrets, setSecrets] = useState<Secret[]>([]);
   const [selectedForRevoke, setSelectedForRevoke] = useState<Set<string>>(new Set());
   const [vaultForm, setVaultForm] = useState({
-    owner: "",
     key: "",
     value: "",
     redactedView: "",
@@ -109,6 +124,10 @@ export default function App() {
     userId: "",
     role: "user",
   });
+  const [addUserStep, setAddUserStep] = useState<1 | 2>(1);
+  const [newUserScopes, setNewUserScopes] = useState<Set<string>>(new Set());
+  const [showAdmin, setShowAdmin] = useState(false);
+  const [adminPerm, setAdminPerm] = useState<string | null>(null);
   const messageEnd = useRef<HTMLDivElement>(null);
   const selectedIdRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
@@ -126,10 +145,35 @@ export default function App() {
     ? (users.find((u) => u.userId === selected.ownerId)?.role ?? "user")
     : "user";
 
-  const vaultSecrets = useMemo(
-    () => (selected ? secrets.filter((s) => s.owner === selected.ownerId) : []),
-    [secrets, selected],
-  );
+  /** The full permission catalog for the admin panel + add-user wizard: every
+   *  per-key read/write for each centralized secret, plus the deploy scopes.
+   *  `riskMap` looks up a scope's inherent risk (read = baseline, write/prod =
+   *  elevated) for the detail view. */
+  const catalog = useMemo(() => {
+    const secretEntries: { scope: string; risk: "baseline" | "elevated" }[] = [];
+    const riskMap = new Map<string, "baseline" | "elevated">();
+    for (const s of secrets) {
+      const readScope = "read:secrets:" + s.key;
+      const writeScope = "write:secrets:" + s.key;
+      secretEntries.push({ scope: readScope, risk: "baseline" });
+      secretEntries.push({ scope: writeScope, risk: "elevated" });
+      riskMap.set(readScope, "baseline");
+      riskMap.set(writeScope, "elevated");
+    }
+    const deployEntries = [
+      { scope: "act:deploy:dev", risk: "baseline" as const },
+      { scope: "act:deploy:prod", risk: "elevated" as const },
+    ];
+    for (const e of deployEntries) riskMap.set(e.scope, e.risk);
+    const groups: {
+      label: string;
+      entries: { scope: string; risk: "baseline" | "elevated" }[];
+    }[] = [
+      { label: "Secrets", entries: secretEntries },
+      { label: "Deploy", entries: deployEntries },
+    ];
+    return { groups, riskMap };
+  }, [secrets]);
 
   const refreshAgents = useCallback(async () => {
     const { agents: next } = await api.listAgents();
@@ -424,14 +468,14 @@ export default function App() {
       setError("Only admins may manage secrets.");
       return;
     }
-    const { owner, key, value, redactedView } = vaultForm;
-    if (!owner.trim() || !key.trim() || !value) return;
+    const { key, value, redactedView } = vaultForm;
+    if (!key.trim() || !value) return;
     setBusy(true);
     setError(null);
     try {
-      await api.addSecret(owner.trim(), key.trim(), value, redactedView.trim() || undefined);
+      await api.addSecret(key.trim(), value, redactedView.trim() || undefined);
       await refreshSecrets();
-      setVaultForm({ owner: "", key: "", value: "", redactedView: "" });
+      setVaultForm({ key: "", value: "", redactedView: "" });
       setShowVaultForm(false);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -440,16 +484,16 @@ export default function App() {
     }
   };
 
-  const revokeSecret = async (owner: string, key: string) => {
+  const revokeSecret = async (key: string) => {
     if (currentRole !== "admin") {
       setError("Only admins may manage secrets.");
       return;
     }
-    if (!window.confirm("Revoke secret " + owner + "/" + key + "?")) return;
+    if (!window.confirm("Revoke secret " + key + "?")) return;
     setBusy(true);
     setError(null);
     try {
-      await api.revokeSecret(owner, key);
+      await api.revokeSecret(key);
       await refreshSecrets();
       if (selected) {
         const result = await api.audit(selected.id);
@@ -462,8 +506,16 @@ export default function App() {
     }
   };
 
-  const addUser = async (event: React.FormEvent) => {
-    event.preventDefault();
+  const toggleNewUserScope = (scope: string) => {
+    setNewUserScopes((prev) => {
+      const next = new Set(prev);
+      if (next.has(scope)) next.delete(scope);
+      else next.add(scope);
+      return next;
+    });
+  };
+
+  const submitAddUser = async () => {
     if (currentRole !== "admin") {
       setError("Only admins may add users.");
       return;
@@ -473,11 +525,39 @@ export default function App() {
     setError(null);
     try {
       const userId = newUserForm.userId.trim();
-      await api.addUser(userId, newUserForm.role);
+      await api.addUser(userId, newUserForm.role, [...newUserScopes]);
       await refreshUsers();
       setCurrentUser(userId);
       setShowAddUser(false);
+      setAddUserStep(1);
       setNewUserForm({ userId: "", role: "user" });
+      setNewUserScopes(new Set());
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const grantScopeToUser = async (userId: string, scope: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.grantUserScope(userId, scope);
+      await refreshUsers();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const revokeScopeFromUser = async (userId: string, scope: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.revokeUserScope(userId, scope);
+      await refreshUsers();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -558,7 +638,7 @@ export default function App() {
   const renderPermCell = (scope: string, label: string) => {
     if (!selected) return null;
     const granted = isGranted(selected.scopes ?? [], scope);
-    const risk = classifyScopeClient(scope, selected.ownerId);
+    const risk = classifyScopeClient(scope);
     const checked = selectedForRevoke.has(scope);
     return (
       <div key={scope} className={"perm-cell" + (granted ? " perm-granted" : "")}>
@@ -674,25 +754,55 @@ export default function App() {
             ))}
           </div>
           {currentRole === "admin" && (
-            <button
-              style={{
-                width: "100%",
-                minHeight: 32,
-                fontSize: 11,
-                border: "1px solid #3d3d38",
-                background: "#292925",
-                color: "#c9c8c1",
-                borderRadius: 9,
-                cursor: "pointer",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: 6,
-              }}
-              onClick={() => setShowAddUser(true)}
-            >
-              <span>＋</span> Add user
-            </button>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button
+                style={{
+                  flex: 1,
+                  minHeight: 32,
+                  fontSize: 11,
+                  border: "1px solid #3d3d38",
+                  background: "#292925",
+                  color: "#c9c8c1",
+                  borderRadius: 9,
+                  cursor: "pointer",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 6,
+                }}
+                onClick={() => {
+                  setAddUserStep(1);
+                  setNewUserScopes(new Set());
+                  setShowAddUser(true);
+                }}
+              >
+                <span>＋</span> Add user
+              </button>
+              <button
+                style={{
+                  flex: 1,
+                  minHeight: 32,
+                  fontSize: 11,
+                  border: "1px solid #3d3d38",
+                  background: "#292925",
+                  color: "#c9c8c1",
+                  borderRadius: 9,
+                  cursor: "pointer",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 6,
+                }}
+                onClick={() => {
+                  setAdminPerm(null);
+                  void refreshSecrets();
+                  void refreshUsers();
+                  setShowAdmin(true);
+                }}
+              >
+                <span>⚙</span> Admin
+              </button>
+            </div>
           )}
         </div>
 
@@ -1043,13 +1153,13 @@ export default function App() {
                     <span>read</span>
                     <span>write</span>
                   </div>
-                  {vaultSecrets.map((s) => {
-                    const readScope = "read:secrets:" + s.owner + "/" + s.key;
-                    const writeScope = "write:secrets:" + s.owner + "/" + s.key;
+                  {secrets.map((s) => {
+                    const readScope = "read:secrets:" + s.key;
+                    const writeScope = "write:secrets:" + s.key;
                     return (
-                      <div className="perm-row" key={s.owner + "/" + s.key}>
+                      <div className="perm-row" key={s.key}>
                         <div className="perm-label" title={readScope}>
-                          {s.owner}/{s.key}
+                          {s.key}
                         </div>
                         {renderPermCell(readScope, "read")}
                         {renderPermCell(writeScope, "write")}
@@ -1061,10 +1171,8 @@ export default function App() {
                     {renderPermCell("act:deploy:dev", "dev")}
                     {renderPermCell("act:deploy:prod", "prod")}
                   </div>
-                  {vaultSecrets.length === 0 && (
-                    <div className="perm-empty">
-                      No secrets registered for {selected.ownerId}.
-                    </div>
+                  {secrets.length === 0 && (
+                    <div className="perm-empty">No secrets registered yet.</div>
                   )}
                 </div>
 
@@ -1096,19 +1204,14 @@ export default function App() {
               <div className="policy-section">
                 <div className="playground-topbar" style={{ marginBottom: 4 }}>
                   <div>
-                    <span className="eyebrow">Vault · {selected.ownerId}</span>
+                    <span className="eyebrow">Vault</span>
                   </div>
                   {currentRole === "admin" && (
                     <button
                       className="button button-ghost"
                       style={{ minHeight: 30, fontSize: 11, padding: "0 10px" }}
                       onClick={() => {
-                        setVaultForm({
-                          owner: selected.ownerId ?? "",
-                          key: "",
-                          value: "",
-                          redactedView: "",
-                        });
+                        setVaultForm({ key: "", value: "", redactedView: "" });
                         setShowVaultForm((v) => !v);
                       }}
                     >
@@ -1119,37 +1222,24 @@ export default function App() {
 
                 {currentRole !== "admin" && (
                   <div className="perm-empty">
-                    Only admins may manage secrets. You can view your own secrets read-only.
+                    Only admins may manage secrets. You can view the catalog read-only.
                   </div>
                 )}
 
                 {currentRole === "admin" && showVaultForm && (
                   <form className="vault-form" onSubmit={addSecret}>
-                    <div className="form-grid">
-                      <label>
-                        Owner
-                        <input
-                          value={vaultForm.owner}
-                          onChange={(event) =>
-                            setVaultForm({ ...vaultForm, owner: event.target.value })
-                          }
-                          required
-                          maxLength={60}
-                        />
-                      </label>
-                      <label>
-                        Key
-                        <input
-                          value={vaultForm.key}
-                          onChange={(event) =>
-                            setVaultForm({ ...vaultForm, key: event.target.value })
-                          }
-                          required
-                          maxLength={120}
-                          placeholder="db-url"
-                        />
-                      </label>
-                    </div>
+                    <label>
+                      Key
+                      <input
+                        value={vaultForm.key}
+                        onChange={(event) =>
+                          setVaultForm({ ...vaultForm, key: event.target.value })
+                        }
+                        required
+                        maxLength={120}
+                        placeholder="dev-db-url"
+                      />
+                    </label>
                     <label>
                       Value
                       <textarea
@@ -1175,12 +1265,7 @@ export default function App() {
                     <div className="modal-footer" style={{ marginTop: 4 }}>
                       <button
                         className="button button-primary"
-                        disabled={
-                          busy ||
-                          !vaultForm.owner.trim() ||
-                          !vaultForm.key.trim() ||
-                          !vaultForm.value
-                        }
+                        disabled={busy || !vaultForm.key.trim() || !vaultForm.value}
                       >
                         {busy ? <Spinner /> : "Save secret"}
                       </button>
@@ -1189,14 +1274,14 @@ export default function App() {
                 )}
 
                 <div className="vault-grid">
-                  {vaultSecrets.map((s) => (
-                    <div className="vault-card" key={s.owner + "/" + s.key}>
+                  {secrets.map((s) => (
+                    <div className="vault-card" key={s.key}>
                       <div className="vault-card-head">
-                        <code className="vault-key">{s.owner}/{s.key}</code>
+                        <code className="vault-key">{s.key}</code>
                         {currentRole === "admin" && (
                           <button
                             className="perm-x"
-                            onClick={() => revokeSecret(s.owner, s.key)}
+                            onClick={() => revokeSecret(s.key)}
                             disabled={busy}
                             title="Revoke secret"
                           >
@@ -1207,8 +1292,8 @@ export default function App() {
                       <div className="vault-redacted">{s.redactedView}</div>
                     </div>
                   ))}
-                  {vaultSecrets.length === 0 && (
-                    <div className="perm-empty">No secrets for {selected.ownerId}.</div>
+                  {secrets.length === 0 && (
+                    <div className="perm-empty">No secrets registered yet.</div>
                   )}
                 </div>
               </div>
@@ -1284,78 +1369,133 @@ export default function App() {
 
             {policyTab === "owner" && (
               <div className="policy-section">
-                <div className="playground-topbar" style={{ marginBottom: 4 }}>
+                <div className="owner-ownerbar">
                   <div>
-                    <span className="eyebrow">Ownership &amp; identity</span>
+                    <span className="eyebrow">Owner view</span>
+                    <h2>Agents owned by {currentUser}</h2>
+                    <p className="owner-note" style={{ margin: "2px 0 0" }}>
+                      These are your agents and the permissions each was granted. Owner-based:
+                      only agents you own appear here — the selected one is expanded.
+                    </p>
                   </div>
+                  <span className="eyebrow">{agents.length}</span>
                 </div>
 
-                <div className="owner-card">
-                  <span className="eyebrow">Acting on behalf of</span>
-                  <div className="owner-row">
-                    <strong>{selected.ownerId}</strong>
-                    <span className={"role-badge role-" + ownerRole}>{ownerRole}</span>
-                  </div>
-                  <code className="owner-principal">user:{selected.ownerId}</code>
-                </div>
+                {agents.length === 0 ? (
+                  <div className="perm-empty">You own no agents yet.</div>
+                ) : (
+                  <div className="owner-accordion">
+                    {agents.map((agent) => {
+                      const expanded = agent.id === selectedId;
+                      return (
+                        <div
+                          key={agent.id}
+                          className={"owner-agent" + (expanded ? " owner-agent-open" : "")}
+                        >
+                          <button
+                            type="button"
+                            className="owner-agent-head"
+                            onClick={() => setSelectedId(agent.id)}
+                          >
+                            <span className={"mini-dot mini-" + agent.status} />
+                            <strong>{agent.name}</strong>
+                            <span className="owner-agent-meta">
+                              {agent.scopes?.length ?? 0} scopes · {agent.status}
+                            </span>
+                            {agent.plan && (
+                              <span className="admin-chip">{agent.plan.source}</span>
+                            )}
+                            <span className="owner-chevron">{expanded ? "▾" : "▸"}</span>
+                          </button>
 
-                <div className="owner-card">
-                  <span className="eyebrow">Agent identity</span>
-                  <div className="owner-kv">
-                    <span>id</span>
-                    <code>{selected.id.slice(0, 8)}</code>
-                  </div>
-                  <div className="owner-kv">
-                    <span>status</span>
-                    <code>{selected.status}</code>
-                  </div>
-                  <div className="owner-kv">
-                    <span>session</span>
-                    <code>{selected.codexThreadId ? selected.codexThreadId.slice(0, 8) : "none"}</code>
-                  </div>
-                  <div className="owner-kv">
-                    <span>workspace</span>
-                    <code>{selected.workspacePath}</code>
-                  </div>
-                  <div className="owner-kv">
-                    <span>created</span>
-                    <code>{formatTime(selected.createdAt)}</code>
-                  </div>
-                </div>
+                          {expanded && (
+                            <div className="owner-agent-body">
+                              <div className="owner-kv-grid">
+                                <div className="owner-kv">
+                                  <span>id</span>
+                                  <code>{agent.id.slice(0, 8)}</code>
+                                </div>
+                                <div className="owner-kv">
+                                  <span>session</span>
+                                  <code>
+                                    {agent.codexThreadId
+                                      ? agent.codexThreadId.slice(0, 8)
+                                      : "none"}
+                                  </code>
+                                </div>
+                                <div className="owner-kv">
+                                  <span>created</span>
+                                  <code>{formatTime(agent.createdAt)}</code>
+                                </div>
+                              </div>
 
-                <div className="owner-card">
-                  <span className="eyebrow">Credential</span>
-                  <p className="owner-note">
-                    Scopes are minted into a per-run Tier 1 credential at run start. Revoke it
-                    to degrade the active run — the next relay request returns 401.
-                  </p>
-                  <button
-                    className="button button-ghost"
-                    style={{ minHeight: 32, fontSize: 11, alignSelf: "flex-start" }}
-                    onClick={revokeCredential}
-                    disabled={busy || selected.status === "busy"}
-                  >
-                    Revoke credential
-                  </button>
-                </div>
+                              <div className="owner-scopes">
+                                <div className="owner-scopes-head">
+                                  <span className="eyebrow">
+                                    Permissions · {agent.scopes?.length ?? 0}
+                                  </span>
+                                  <button
+                                    className="button button-danger"
+                                    style={{ minHeight: 28, fontSize: 10, padding: "0 8px" }}
+                                    disabled={busy || selectedForRevoke.size === 0}
+                                    onClick={revokeSelected}
+                                  >
+                                    Revoke selected ({selectedForRevoke.size})
+                                  </button>
+                                </div>
+                                {(agent.scopes ?? []).length === 0 ? (
+                                  <div className="perm-empty">No scopes granted.</div>
+                                ) : (
+                                  <div className="owner-scope-list">
+                                    {(agent.scopes ?? []).map((scope) => {
+                                      const risk = classifyScopeClient(scope);
+                                      return (
+                                        <div key={scope} className="owner-scope">
+                                          <span
+                                            className={
+                                              "mini-dot mini-" +
+                                              (risk === "baseline" ? "ready" : "warning")
+                                            }
+                                          />
+                                          <code>{scope}</code>
+                                          <label className="perm-check">
+                                            <input
+                                              type="checkbox"
+                                              checked={selectedForRevoke.has(scope)}
+                                              onChange={() => toggleRevokeSelect(scope)}
+                                              disabled={busy}
+                                            />
+                                          </label>
+                                          <button
+                                            className="perm-x"
+                                            onClick={() => revokeScope(scope)}
+                                            disabled={busy}
+                                            title="Revoke scope"
+                                          >
+                                            ×
+                                          </button>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                              </div>
 
-                <div className="owner-card">
-                  <span className="eyebrow">Owner's secret keys</span>
-                  {vaultSecrets.length > 0 ? (
-                    <div className="vault-grid">
-                      {vaultSecrets.map((s) => (
-                        <div className="vault-card" key={s.owner + "/" + s.key}>
-                          <code className="vault-key">{s.key}</code>
-                          <div className="vault-redacted">{s.redactedView}</div>
+                              <button
+                                className="button button-ghost"
+                                style={{ minHeight: 30, fontSize: 11, alignSelf: "flex-start" }}
+                                onClick={revokeCredential}
+                                disabled={busy || agent.status === "busy"}
+                              >
+                                Revoke credential
+                              </button>
+                            </div>
+                          )}
                         </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="perm-empty">
-                      No secrets registered for {selected.ownerId}.
-                    </div>
-                  )}
-                </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             )}
           </>
@@ -1526,82 +1666,294 @@ export default function App() {
       )}
 
       {showAddUser && (
-        <div className="modal-backdrop" onMouseDown={() => setShowAddUser(false)}>
+        <div
+          className="modal-backdrop"
+          onMouseDown={() => {
+            setShowAddUser(false);
+            setAddUserStep(1);
+            setNewUserScopes(new Set());
+          }}
+        >
           <form
             className="modal"
-            style={{ width: "min(420px, 100%)" }}
-            onSubmit={addUser}
+            style={{ width: "min(560px, 100%)" }}
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (addUserStep === 1) {
+                if (newUserForm.userId.trim()) setAddUserStep(2);
+              } else {
+                void submitAddUser();
+              }
+            }}
             onMouseDown={(event) => event.stopPropagation()}
           >
             <div className="modal-heading">
               <div>
                 <span className="eyebrow">Users &amp; roles</span>
-                <h2>Add user</h2>
+                <h2>Add user{addUserStep === 2 ? " · permissions" : ""}</h2>
                 <p>
-                  Register a mock principal. Non-admin users see only their own secrets and
-                  agents.
+                  {addUserStep === 1
+                    ? "Register a mock principal. Non-admin users see only their own secrets and agents."
+                    : "Pick the permissions " +
+                      (newUserForm.userId || "the user") +
+                      " inherits. Adjust later in the Admin panel."}
                 </p>
               </div>
-              <button type="button" onClick={() => setShowAddUser(false)}>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowAddUser(false);
+                  setAddUserStep(1);
+                  setNewUserScopes(new Set());
+                }}
+              >
                 ×
               </button>
             </div>
-            <label>
-              User ID
-              <input
-                autoFocus
-                value={newUserForm.userId}
-                onChange={(event) =>
-                  setNewUserForm({ ...newUserForm, userId: event.target.value })
-                }
-                required
-                maxLength={60}
-                placeholder="e.g. carol"
-              />
-            </label>
-            <label>
-              Role
-              <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
-                {(["user", "admin"] as const).map((r) => (
-                  <button
-                    key={r}
-                    type="button"
-                    onClick={() => setNewUserForm({ ...newUserForm, role: r })}
-                    style={{
-                      flex: 1,
-                      minHeight: 36,
-                      borderRadius: 9,
-                      border: "1px solid",
-                      borderColor: newUserForm.role === r ? "#6954d9" : "#d9d7cf",
-                      background: newUserForm.role === r ? "#efecff" : "#fff",
-                      color: newUserForm.role === r ? "#513db9" : "#575851",
-                      fontWeight: 600,
-                      fontSize: 12,
-                      cursor: "pointer",
-                      textTransform: "capitalize",
-                    }}
-                  >
-                    {r}
-                  </button>
+
+            {addUserStep === 1 ? (
+              <>
+                <label>
+                  User ID
+                  <input
+                    autoFocus
+                    value={newUserForm.userId}
+                    onChange={(event) =>
+                      setNewUserForm({ ...newUserForm, userId: event.target.value })
+                    }
+                    required
+                    maxLength={60}
+                    placeholder="e.g. carol"
+                  />
+                </label>
+                <label>
+                  Role
+                  <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                    {(["user", "admin"] as const).map((r) => (
+                      <button
+                        key={r}
+                        type="button"
+                        onClick={() => setNewUserForm({ ...newUserForm, role: r })}
+                        style={{
+                          flex: 1,
+                          minHeight: 36,
+                          borderRadius: 9,
+                          border: "1px solid",
+                          borderColor: newUserForm.role === r ? "#6954d9" : "#d9d7cf",
+                          background: newUserForm.role === r ? "#efecff" : "#fff",
+                          color: newUserForm.role === r ? "#513db9" : "#575851",
+                          fontWeight: 600,
+                          fontSize: 12,
+                          cursor: "pointer",
+                          textTransform: "capitalize",
+                        }}
+                      >
+                        {r}
+                      </button>
+                    ))}
+                  </div>
+                </label>
+              </>
+            ) : (
+              <div className="admin-wizard-catalog">
+                {catalog.groups.map((group) => (
+                  <div key={group.label} className="admin-group">
+                    <div className="admin-group-title">{group.label}</div>
+                    {group.entries.map((entry) => (
+                      <label
+                        key={entry.scope}
+                        className={
+                          "admin-perm admin-perm-toggle" +
+                          (newUserScopes.has(entry.scope) ? " admin-perm-active" : "")
+                        }
+                      >
+                        <span
+                          className={
+                            "mini-dot mini-" +
+                            (entry.risk === "baseline" ? "ready" : "warning")
+                          }
+                        />
+                        <code>{entry.scope}</code>
+                        <input
+                          type="checkbox"
+                          checked={newUserScopes.has(entry.scope)}
+                          onChange={() => toggleNewUserScope(entry.scope)}
+                        />
+                      </label>
+                    ))}
+                  </div>
                 ))}
               </div>
-            </label>
+            )}
+
+            {error && (
+              <div className="error-banner" role="alert">
+                <span>{error}</span>
+              </div>
+            )}
+
             <div className="modal-footer">
               <button
                 type="button"
                 className="button button-ghost"
-                onClick={() => setShowAddUser(false)}
+                onClick={() => {
+                  setShowAddUser(false);
+                  setAddUserStep(1);
+                  setNewUserScopes(new Set());
+                }}
               >
                 Cancel
               </button>
-              <button
-                className="button button-primary"
-                disabled={busy || !newUserForm.userId.trim()}
-              >
-                {busy ? <Spinner /> : "Add user"}
-              </button>
+              {addUserStep === 1 ? (
+                <button
+                  type="button"
+                  className="button button-primary"
+                  disabled={!newUserForm.userId.trim()}
+                  onClick={() => setAddUserStep(2)}
+                >
+                  Next
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="button button-ghost"
+                    onClick={() => setAddUserStep(1)}
+                  >
+                    Back
+                  </button>
+                  <button type="submit" className="button button-primary" disabled={busy}>
+                    {busy ? <Spinner /> : "Add user"}
+                  </button>
+                </>
+              )}
             </div>
           </form>
+        </div>
+      )}
+
+      {showAdmin && currentRole === "admin" && (
+        <div className="modal-backdrop admin-backdrop" onMouseDown={() => setShowAdmin(false)}>
+          <div className="admin-panel" onMouseDown={(event) => event.stopPropagation()}>
+            <header className="admin-header">
+              <div>
+                <span className="eyebrow">Admin</span>
+                <h2>User permissions</h2>
+              </div>
+              <button type="button" onClick={() => setShowAdmin(false)}>
+                ×
+              </button>
+            </header>
+            <div className="admin-body">
+              <aside className="admin-catalog">
+                {catalog.groups.map((group) => (
+                  <div key={group.label} className="admin-group">
+                    <div className="admin-group-title">{group.label}</div>
+                    {group.entries.map((entry) => {
+                      const usersWith = users.filter((u) =>
+                        userHasPermission(u, entry.scope),
+                      );
+                      return (
+                        <button
+                          key={entry.scope}
+                          type="button"
+                          className={
+                            "admin-perm" +
+                            (adminPerm === entry.scope ? " admin-perm-active" : "")
+                          }
+                          onClick={() => setAdminPerm(entry.scope)}
+                        >
+                          <span
+                            className={
+                              "mini-dot mini-" +
+                              (entry.risk === "baseline" ? "ready" : "warning")
+                            }
+                          />
+                          <code>{entry.scope}</code>
+                          <span className="admin-perm-count">{usersWith.length}</span>
+                          <span className="admin-breadcrumbs">
+                            {usersWith.slice(0, 3).map((u) => (
+                              <span key={u.userId} className="admin-chip">
+                                {u.userId}
+                              </span>
+                            ))}
+                            {usersWith.length > 3 && (
+                              <span className="admin-chip admin-chip-more">
+                                +{usersWith.length - 3}
+                              </span>
+                            )}
+                            {usersWith.length === 0 && (
+                              <span className="admin-chip admin-chip-none">no one</span>
+                            )}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ))}
+              </aside>
+              <section className="admin-detail">
+                {adminPerm ? (
+                  <>
+                    <div className="admin-detail-head">
+                      <div>
+                        <span className="eyebrow">Permission</span>
+                        <code className="admin-detail-scope">{adminPerm}</code>
+                      </div>
+                      <span
+                        className={
+                          "role-badge role-" +
+                          (catalog.riskMap.get(adminPerm) === "elevated" ? "admin" : "user")
+                        }
+                      >
+                        {catalog.riskMap.get(adminPerm) ?? "unknown"}
+                      </span>
+                    </div>
+                    <div className="admin-user-list">
+                      {users.map((u) => {
+                        const status = userPermissionStatus(u, adminPerm);
+                        const checked = status.kind !== "none";
+                        const disabled =
+                          busy || status.kind === "admin" || status.kind === "via";
+                        return (
+                          <label
+                            key={u.id}
+                            className={"admin-user" + (checked ? " admin-user-granted" : "")}
+                          >
+                            <div className="admin-user-id">
+                              <strong>{u.userId}</strong>
+                              {u.role === "admin" && (
+                                <span className="role-badge role-admin">admin</span>
+                              )}
+                              {status.kind === "via" && (
+                                <span className="admin-via">via {status.via}</span>
+                              )}
+                            </div>
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              disabled={disabled}
+                              onChange={() => {
+                                if (status.kind === "granted") {
+                                  void revokeScopeFromUser(u.userId, adminPerm);
+                                } else if (status.kind === "none") {
+                                  void grantScopeToUser(u.userId, adminPerm);
+                                }
+                              }}
+                            />
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </>
+                ) : (
+                  <div className="perm-empty">
+                    Select a permission to see which users have access and toggle it per user.
+                  </div>
+                )}
+              </section>
+            </div>
+          </div>
         </div>
       )}
     </div>
