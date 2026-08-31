@@ -106,7 +106,9 @@ export default function App() {
   const [audit, setAudit] = useState<Audit[]>([]);
   const [intent, setIntent] = useState("");
   const [plan, setPlan] = useState<IntentPlan | null>(null);
-  const [approvedElevated, setApprovedElevated] = useState<Set<string>>(new Set());
+  /** Scopes the owner has picked for the new agent. Pre-filled by the plan
+   *  (its baseline + elevated), but the owner can toggle ANY catalog scope. */
+  const [createScopes, setCreateScopes] = useState<Set<string>>(new Set());
   const [auditFilter, setAuditFilter] = useState<"all" | "allow" | "deny">("all");
   const [expandedAuditId, setExpandedAuditId] = useState<string | null>(null);
   const [policyTab, setPolicyTab] = useState<PolicyTab>("permissions");
@@ -308,7 +310,9 @@ export default function App() {
     try {
       const { plan: next } = await api.planAgent(intent.trim());
       setPlan(next);
-      setApprovedElevated(new Set(next.elevatedScopes));
+      // Pre-fill the pickable set with the plan's suggested scopes (baseline +
+      // elevated). The owner can then toggle any catalog scope.
+      setCreateScopes(new Set([...next.baselineScopes, ...next.elevatedScopes]));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -316,11 +320,11 @@ export default function App() {
     }
   };
 
-  const toggleElevated = (scope: string, checked: boolean) => {
-    setApprovedElevated((prev) => {
+  const toggleCreateScope = (scope: string) => {
+    setCreateScopes((prev) => {
       const next = new Set(prev);
-      if (checked) next.add(scope);
-      else next.delete(scope);
+      if (next.has(scope)) next.delete(scope);
+      else next.add(scope);
       return next;
     });
   };
@@ -331,10 +335,7 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      const scopes = [
-        ...plan.baselineScopes,
-        ...plan.elevatedScopes.filter((scope) => approvedElevated.has(scope)),
-      ];
+      const scopes = [...createScopes];
       const { agent } = await api.createAgent({
         name: form.name.trim(),
         intent: intent.trim(),
@@ -347,7 +348,7 @@ export default function App() {
       setForm(emptyForm);
       setIntent("");
       setPlan(null);
-      setApprovedElevated(new Set());
+      setCreateScopes(new Set());
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -852,7 +853,7 @@ export default function App() {
             setForm(emptyForm);
             setIntent("");
             setPlan(null);
-            setApprovedElevated(new Set());
+            setCreateScopes(new Set());
             setShowCreate(true);
           }}
         >
@@ -1228,7 +1229,7 @@ export default function App() {
                 setForm(emptyForm);
                 setIntent("");
                 setPlan(null);
-                setApprovedElevated(new Set());
+                setCreateScopes(new Set());
                 setShowCreate(true);
               }}
             >
@@ -1676,72 +1677,42 @@ export default function App() {
                   </span>
                 </div>
                 <p style={{ fontSize: 13, opacity: 0.85, margin: 0 }}>{plan.justification}</p>
-                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  {plan.baselineScopes.map((scope) => (
-                    <div
-                      key={scope}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 8,
-                        padding: "4px 8px",
-                        borderRadius: 8,
-                        background: "rgba(80,220,120,.08)",
-                        fontSize: 13,
-                      }}
-                    >
-                      <span className="mini-dot mini-ready" />
-                      <code style={{ fontSize: 12 }}>{scope}</code>
-                      <span style={{ opacity: 0.6, fontSize: 12 }}>baseline · auto-granted</span>
-                    </div>
-                  ))}
-                  {plan.elevatedScopes.map((scope) => (
-                    <label
-                      key={scope}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 8,
-                        padding: "4px 8px",
-                        borderRadius: 8,
-                        background: "rgba(255,180,80,.1)",
-                        fontSize: 13,
-                        cursor: "pointer",
-                      }}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={approvedElevated.has(scope)}
-                        onChange={(event) => toggleElevated(scope, event.target.checked)}
-                      />
-                      <span className="mini-dot mini-error" />
-                      <code style={{ fontSize: 12 }}>{scope}</code>
-                      <span style={{ opacity: 0.7, fontSize: 12 }}>
-                        elevated — approve? (uncheck to deny → relay will 403)
-                      </span>
-                    </label>
-                  ))}
-                  {plan.unknownScopes.map((scope) => (
-                    <div
-                      key={scope}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 8,
-                        padding: "4px 8px",
-                        borderRadius: 8,
-                        background: "rgba(255,80,80,.08)",
-                        fontSize: 13,
-                      }}
-                    >
-                      <span className="mini-dot mini-error" />
-                      <code style={{ fontSize: 12 }}>{scope}</code>
-                      <span style={{ opacity: 0.6, fontSize: 12 }}>
-                        unknown · rejected (not in taxonomy)
-                      </span>
+                <p className="owner-note" style={{ margin: "0 0 4px" }}>
+                  Pick the permissions for this agent. The plan suggested the checked ones — adjust as needed.
+                </p>
+                <div className="admin-wizard-catalog">
+                  {catalog.groups.map((group) => (
+                    <div key={group.label} className="admin-group">
+                      <div className="admin-group-title">{group.label}</div>
+                      {group.entries.map((entry) => (
+                        <label
+                          key={entry.scope}
+                          className={
+                            "admin-perm admin-perm-toggle" +
+                            (createScopes.has(entry.scope) ? " admin-perm-active" : "")
+                          }
+                        >
+                          <span
+                            className={
+                              "mini-dot mini-" + (entry.risk === "baseline" ? "ready" : "warning")
+                            }
+                          />
+                          <code>{entry.scope}</code>
+                          <input
+                            type="checkbox"
+                            checked={createScopes.has(entry.scope)}
+                            onChange={() => toggleCreateScope(entry.scope)}
+                          />
+                        </label>
+                      ))}
                     </div>
                   ))}
                 </div>
+                {plan.unknownScopes.length > 0 && (
+                  <div className="perm-empty" style={{ marginTop: 4 }}>
+                    Rejected (not in taxonomy): {plan.unknownScopes.join(", ")}
+                  </div>
+                )}
               </div>
             )}
             <div className="modal-footer">
