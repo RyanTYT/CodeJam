@@ -127,6 +127,7 @@ describe("boundary 3 — relay policy", () => {
     expect(result.status).toBe(403);
     const denial = service.listAudit("agent-1").find((entry) => entry.reason === "capability not granted");
     expect(denial).toMatchObject({
+      scope: "act:deploy:prod",
       operationRiskLevel: "high",
       operationRiskFactors: expect.arrayContaining(["required scope was not granted"]),
     });

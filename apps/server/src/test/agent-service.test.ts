@@ -142,6 +142,79 @@ describe("Agent lifecycle", () => {
     }));
   });
 
+  it("keeps progress and response events correlated to their own user messages", async () => {
+    let invocation = 0;
+    const runner: AgentRunner = {
+      run: async (request) => {
+        invocation += 1;
+        const event = {
+          id: `command-${invocation}`,
+          type: "command_execution",
+          label: "Command",
+          summary: "Ran command",
+          detail: `Command: echo run-${invocation}`,
+          timestamp: new Date().toISOString(),
+        };
+        await request.onProgress?.(event);
+        return {
+          output: `Completed run ${invocation}`,
+          threadId: `thread-${invocation}`,
+          usage: null,
+          progress: [event],
+        };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const service = await makeService(runner);
+    const agent = await service.createAgent({ name: "Timeline" });
+    const first = await service.sendMessage(agent.id, "first request");
+    await expect.poll(() => service.getRun(first.run.id).status).toBe("completed");
+    const second = await service.sendMessage(agent.id, "second request");
+    await expect.poll(() => service.getRun(second.run.id).status).toBe("completed");
+
+    for (const run of [first.run, second.run]) {
+      const stored = service.getRun(run.id);
+      expect(stored.progress.filter((event) => event.type === "command_execution")).toHaveLength(1);
+      expect(stored.progress).toContainEqual(expect.objectContaining({
+        id: `response-${run.id}`,
+        type: "response_ready",
+      }));
+    }
+    const messages = service.getMessages(agent.id);
+    expect(messages.filter((message) => message.runId === first.run.id)).toHaveLength(2);
+    expect(messages.filter((message) => message.runId === second.run.id)).toHaveLength(2);
+  });
+
+  it("preserves progress and marks workflow evidence failed when the Agent run fails", async () => {
+    const failureEvent = {
+      id: "command-failed",
+      type: "command_execution",
+      label: "Command",
+      summary: "Ran command",
+      detail: "Command: exit 1",
+      timestamp: new Date().toISOString(),
+    };
+    const runner: AgentRunner = {
+      run: async (request) => {
+        await request.onProgress?.(failureEvent);
+        throw new Error("command exited with code 1");
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const service = await makeService(runner);
+    const agent = await service.createAgent({ name: "Failed timeline" });
+    const { run } = await service.sendMessage(agent.id, "fail this request");
+
+    await expect.poll(() => service.getRun(run.id).status).toBe("failed");
+    const stored = service.getRun(run.id);
+    expect(stored.progress).toContainEqual(failureEvent);
+    expect(stored.progress.some((event) => event.type === "response_ready")).toBe(false);
+    expect(service.getWorkflow(run.id).every((node) => node.status === "failed" && node.completedAt)).toBe(true);
+    expect(service.getMessages(agent.id).filter((message) => message.runId === run.id)).toHaveLength(1);
+  });
+
   it("tracks workflow hierarchy and risk snapshots for a run", async () => {
     const service = await makeService();
     const agent = await service.createAgent({ name: "Workflow" });
