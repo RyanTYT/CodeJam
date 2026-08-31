@@ -9,6 +9,15 @@ import { MockResourceService } from "./mock-resource-service.js";
 import { createMockApp } from "./mock-resource-server.js";
 import { IntentPlanner } from "./intent-planner.js";
 
+// Load .env from the project root so `tsx watch` (dev) picks up ARK_API_KEY /
+// ARK_MODEL / REAL_UPSTREAM_SECRET without manual exporting. Existing env vars
+// take precedence (loadEnvFile does not override). No-op if .env is absent.
+try {
+  process.loadEnvFile(path.resolve(import.meta.dirname, "../../../.env"));
+} catch {
+  // .env absent (CI / containers) — fall back to the real environment.
+}
+
 const config = loadConfig();
 await writeCodexConfig(config);
 
