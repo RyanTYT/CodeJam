@@ -1286,32 +1286,37 @@ export default function App() {
                   <p className="perm-intent">Intent: {selected.plan.intent}</p>
                 )}
 
-                <div className="perm-map">
-                  <div className="perm-row perm-row-head">
-                    <span />
-                    <span>read</span>
-                    <span>write</span>
-                  </div>
-                  {secrets.map((s) => {
-                    const readScope = "read:secrets:" + s.key;
-                    const writeScope = "write:secrets:" + s.key;
-                    return (
-                      <div className="perm-row" key={s.key}>
-                        <div className="perm-label" title={readScope}>
-                          {s.key}
+                <div className="owner-scope-list">
+                  {(selected.scopes ?? []).length === 0 ? (
+                    <div className="perm-empty">No permissions granted to this agent.</div>
+                  ) : (
+                    (selected.scopes ?? []).map((scope) => {
+                      const risk = classifyScopeClient(scope);
+                      return (
+                        <div className="owner-scope" key={scope}>
+                          <span
+                            className={"mini-dot mini-" + (risk === "baseline" ? "ready" : "warning")}
+                          />
+                          <code>{scope}</code>
+                          <label className="perm-check">
+                            <input
+                              type="checkbox"
+                              checked={selectedForRevoke.has(scope)}
+                              onChange={() => toggleRevokeSelect(scope)}
+                              disabled={busy}
+                            />
+                          </label>
+                          <button
+                            className="perm-x"
+                            onClick={() => revokeScope(scope)}
+                            disabled={busy}
+                            title="Revoke scope"
+                          >
+                            ×
+                          </button>
                         </div>
-                        {renderPermCell(readScope, "read")}
-                        {renderPermCell(writeScope, "write")}
-                      </div>
-                    );
-                  })}
-                  <div className="perm-row">
-                    <div className="perm-label">deploy</div>
-                    {renderPermCell("act:deploy:dev", "dev")}
-                    {renderPermCell("act:deploy:prod", "prod")}
-                  </div>
-                  {secrets.length === 0 && (
-                    <div className="perm-empty">No secrets registered yet.</div>
+                      );
+                    })
                   )}
                 </div>
 
