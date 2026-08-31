@@ -3,6 +3,7 @@ import path from "node:path";
 import type { Database } from "./types.js";
 
 const CURRENT_VERSION = 3;
+const CURRENT_VERSION = 3;
 
 const emptyDatabase = (): Database => ({
   version: CURRENT_VERSION,
@@ -27,6 +28,7 @@ const emptyDatabase = (): Database => ({
  */
 function migrate(parsed: Partial<Database>): Database {
   const version = parsed.version as number | undefined;
+  if (version !== 1 && version !== 2 && version !== CURRENT_VERSION) {
   if (version !== 1 && version !== 2 && version !== CURRENT_VERSION) {
     throw new Error("Unsupported database format");
   }
@@ -90,6 +92,8 @@ function migrate(parsed: Partial<Database>): Database {
     agentRiskProfiles: [],
     users: [],
   };
+
+  return baseDatabase;
 
   return baseDatabase;
 }

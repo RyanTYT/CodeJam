@@ -24,6 +24,7 @@ import type {
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 import { calculateAgentRiskProfile } from "./risk-engine.js";
+import { calculateAgentRiskProfile } from "./risk-engine.js";
 
 const now = () => new Date().toISOString();
 

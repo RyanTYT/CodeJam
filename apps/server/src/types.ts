@@ -243,6 +243,61 @@ export interface WorkflowNode {
   riskLevel: RiskLevel; // snapshot of agent's risk at node creation
   createdAt: string;
   completedAt?: string;
+  /** Operation-level risk assessment (Phase 1 enhancement). */
+  operationRiskLevel?: "low" | "medium" | "high";
+  operationRiskScore?: number; // 0-100
+  operationRiskFactors?: string[];
+  /** Workflow hierarchy tracking (Phase 1 enhancement). */
+  nodeId?: string;
+  parentNodeId?: string;
+}
+
+/** Risk level classification (Phase 1 enhancement). */
+export type RiskLevel = "low" | "medium" | "high";
+
+/**
+ * Agent-level risk profile: computed from scope capabilities and audit history.
+ * Captures the overall risk an agent poses based on its declared scopes and
+ * behavioral patterns.
+ */
+export interface AgentRiskProfile {
+  agentId: string;
+  agentRiskLevel: RiskLevel;
+  riskScore: number; // 0-100
+  riskFactors: string[]; // e.g., ["elevated_scope_present", "secrets_access", "wildcard_scopes"]
+  lastAssessedAt: string;
+  assessmentMethod: "scope_based" | "behavior_based" | "hybrid";
+}
+
+/**
+ * Operation-level risk assessment: computed per authorization request.
+ * Evaluates the specific request (not the agent's overall capability) to
+ * determine if this operation should be approved/flagged/denied.
+ */
+export interface OperationRiskAssessment {
+  operationRiskLevel: RiskLevel;
+  operationRiskScore: number; // 0-100
+  scopeIntersectionRisk: number; // What is being requested (0-100)
+  auditContextRisk: number; // Historical pattern match (0-100)
+  operationRiskFactors: string[];
+  requiresApproval: boolean;
+}
+
+/**
+ * Workflow hierarchy node: tracks agent/task relationships and status.
+ * Allows audit trail to show which agent/task in the workflow tree
+ * triggered each audit event.
+ */
+export interface WorkflowNode {
+  id: string; // nodeId, unique per run
+  type: "orchestrator" | "agent" | "task";
+  parentId?: string; // parent node (for hierarchy)
+  runId: string; // which run/execution
+  agentId?: string; // associated agent (if type === "agent")
+  status: "queued" | "running" | "completed" | "failed" | "pending_approval";
+  riskLevel: RiskLevel; // snapshot of agent's risk at node creation
+  createdAt: string;
+  completedAt?: string;
 }
 
 /** Risk classification for a scope, used to decide auto-grant vs approval. */
