@@ -8,6 +8,8 @@ const starterPrompts = [
   "Build a responsive single-page todo app with tests.",
 ];
 
+const SHOW_DEMO_LOGS = true;
+
 const emptyForm = {
   name: "",
   description: "",
@@ -15,13 +17,20 @@ const emptyForm = {
     "Help me build and test software in this workspace. Keep changes small and explain the result.",
 };
 
-const POLICY_TABS = ["permissions", "vault", "decisions", "owner"] as const;
+const POLICY_TABS = ["permissions", "vault", "owner"] as const;
 type PolicyTab = (typeof POLICY_TABS)[number];
 
 function formatTime(value: string): string {
   return new Intl.DateTimeFormat(undefined, {
     hour: "2-digit",
     minute: "2-digit",
+  }).format(new Date(value));
+}
+
+function formatDateTime(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
   }).format(new Date(value));
 }
 
@@ -105,6 +114,7 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState("default");
   const [audit, setAudit] = useState<Audit[]>([]);
   const [workflow, setWorkflow] = useState<WorkflowNode[]>([]);
+  const [activeTab, setActiveTab] = useState<"chat" | "logs">("chat");
   const [intent, setIntent] = useState("");
   const [plan, setPlan] = useState<IntentPlan | null>(null);
   /** Scopes the owner has picked for the new agent. Pre-filled by the plan
@@ -132,6 +142,8 @@ export default function App() {
   const [newUserScopes, setNewUserScopes] = useState<Set<string>>(new Set());
   const [showAdmin, setShowAdmin] = useState(false);
   const [adminPerm, setAdminPerm] = useState<string | null>(null);
+  const [selectedWorkflowNodeId, setSelectedWorkflowNodeId] = useState<string | null>(null);
+  const [selectedLogId, setSelectedLogId] = useState<string | null>(null);
   const messageEnd = useRef<HTMLDivElement>(null);
   const selectedIdRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
@@ -192,6 +204,154 @@ export default function App() {
     ];
     return { groups, riskMap };
   }, [secrets]);
+
+  const runProgress = useMemo(
+    () => activeRun?.progress ?? [],
+    [activeRun],
+  );
+
+  const agentLogs = useMemo(() => {
+    const items: Array<{
+      id: string;
+      timestamp: string;
+      agentId: string | null;
+      agentName: string;
+      runId: string | null;
+      userId: string;
+      summary: string;
+      action: string;
+      capability: string;
+      resource: string;
+      scope: string | null;
+      riskLevel: "low" | "medium" | "high";
+      decision: "allow" | "deny" | "info";
+      detail: string;
+      status?: string;
+    }> = [];
+
+    const auditRows =
+      audit.length > 0 || !selected || !SHOW_DEMO_LOGS
+        ? audit
+        : [
+            {
+              id: "demo-low",
+              timestamp: new Date(Date.now() - 2 * 60_000).toISOString(),
+              humanPrincipalId: "user:" + (selected.ownerId ?? "demo-user"),
+              agentId: selected.id,
+              agentPrincipalId: null,
+              runId: null,
+              method: "GET",
+              action: "Read resource",
+              resource: "secrets:dev-db-url",
+              scope: "read:secrets:dev-db-url",
+              decision: "allow" as const,
+              reason: "capability granted",
+              operationRiskLevel: "low" as const,
+            },
+            {
+              id: "demo-medium",
+              timestamp: new Date(Date.now() - 90_000).toISOString(),
+              humanPrincipalId: "user:" + (selected.ownerId ?? "demo-user"),
+              agentId: selected.id,
+              agentPrincipalId: null,
+              runId: null,
+              method: "POST",
+              action: "Deploy change",
+              resource: "deploy:dev",
+              scope: "act:deploy:dev",
+              decision: "allow" as const,
+              reason: "elevated action approved",
+              operationRiskLevel: "medium" as const,
+            },
+            {
+              id: "demo-high",
+              timestamp: new Date(Date.now() - 30_000).toISOString(),
+              humanPrincipalId: "user:" + (selected.ownerId ?? "demo-user"),
+              agentId: selected.id,
+              agentPrincipalId: null,
+              runId: null,
+              method: "POST",
+              action: "Deploy change",
+              resource: "deploy:prod",
+              scope: "act:deploy:prod",
+              decision: "deny" as const,
+              reason: "capability not granted",
+              operationRiskLevel: "high" as const,
+            },
+          ];
+
+    for (const row of auditRows) {
+      items.push({
+        id: row.id,
+        timestamp: row.timestamp,
+        agentId: row.agentId ?? selected?.id ?? null,
+        agentName: agents.find((agent) => agent.id === row.agentId)?.name ?? "Agent",
+        runId: row.runId,
+        userId: row.humanPrincipalId.replace(/^user:/, ""),
+        summary: `${row.action} on ${row.resource}`,
+        action: row.action,
+        capability: row.method ?? row.resource,
+        resource: row.resource,
+        scope: row.scope,
+        riskLevel: row.operationRiskLevel ?? (row.decision === "deny" ? "high" : "low"),
+        decision: row.decision,
+        detail: row.reason || row.resource,
+      });
+    }
+
+    for (const node of workflow) {
+      items.push({
+        id: node.id,
+        timestamp: node.createdAt,
+        agentId: node.agentId ?? selected?.id ?? null,
+        agentName: agents.find((agent) => agent.id === node.agentId)?.name ?? selected?.name ?? "Agent",
+        runId: node.runId,
+        userId: "—",
+        summary: `${node.status} · ${node.type}`,
+        action: node.type === "agent" ? "Agent node" : node.type === "task" ? "Task execution" : "Workflow orchestration",
+        capability: node.type,
+        resource: node.type,
+        scope: null,
+        riskLevel: node.riskLevel,
+        decision: "info",
+        detail: `${node.status} · ${node.type}`,
+        status: node.status,
+      });
+    }
+
+    for (const item of runProgress) {
+      items.push({
+        id: item.id,
+        timestamp: item.timestamp,
+        agentId: selected?.id ?? null,
+        agentName: selected?.name ?? "Agent",
+        runId: activeRun?.id ?? null,
+        userId: "—",
+        summary: item.summary || "Progress event",
+        action: item.label,
+        capability: item.type,
+        resource: item.type,
+        scope: null,
+        riskLevel: item.type.includes("validation") ? "medium" : item.type.includes("command") ? "high" : "low",
+        decision: "info",
+        detail: item.summary || item.detail || "Progress event",
+      });
+    }
+
+    return items.sort(
+      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+    );
+  }, [activeRun, agents, audit, runProgress, selected, workflow]);
+
+  const selectedWorkflowNode = useMemo(
+    () => workflow.find((node) => node.id === selectedWorkflowNodeId) ?? workflow[0] ?? null,
+    [selectedWorkflowNodeId, workflow],
+  );
+
+  const selectedLog = useMemo(
+    () => agentLogs.find((log) => log.id === selectedLogId) ?? agentLogs[0] ?? null,
+    [agentLogs, selectedLogId],
+  );
 
   const refreshAgents = useCallback(async () => {
     const { agents: next } = await api.listAgents();
@@ -295,6 +455,19 @@ export default function App() {
   }, [refreshMessages, selectedId, refreshSecrets]);
 
   useEffect(() => {
+    if (currentRole !== "admin") return;
+    setAudit([]);
+    const refreshAudit = () => api.audit()
+      .then((result) => {
+        if (mountedRef.current && currentRole === "admin") setAudit(result.audit);
+      })
+      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+    void refreshAudit();
+    const interval = window.setInterval(() => void refreshAudit(), 900);
+    return () => window.clearInterval(interval);
+  }, [currentRole]);
+
+  useEffect(() => {
     if (selected) {
       setForm({
         name: selected.name,
@@ -303,6 +476,17 @@ export default function App() {
       });
     }
   }, [selected]);
+
+  useEffect(() => {
+    if (agentLogs.length === 0) {
+      setSelectedLogId(null);
+      return;
+    }
+
+    if (!selectedLogId || !agentLogs.some((log) => log.id === selectedLogId)) {
+      setSelectedLogId(agentLogs[0].id);
+    }
+  }, [agentLogs, selectedLogId]);
 
   useEffect(() => {
     messageEnd.current?.scrollIntoView({ behavior: "smooth" });
@@ -758,7 +942,7 @@ export default function App() {
   const switcherUsers = users.length > 0 ? users.map((u) => u.userId) : ["default"];
 
   return (
-    <div className={"app-shell" + (currentRole === "admin" ? " app-shell-wide" : "")}>
+    <div className={"app-shell" + (currentRole === "admin" && activeTab === "logs" ? " app-shell-wide" : "")}>
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">A</div>
@@ -948,7 +1132,26 @@ export default function App() {
           </div>
         )}
 
-        {currentRole === "admin" ? (
+        {currentRole === "admin" && (
+          <div className="agent-view-toggle admin-view-toggle" role="tablist" aria-label="Agent views">
+            <button
+              type="button"
+              className={"tab-button " + (activeTab === "chat" ? "tab-active" : "")}
+              onClick={() => setActiveTab("chat")}
+            >
+              Secrets
+            </button>
+            <button
+              type="button"
+              className={"tab-button " + (activeTab === "logs" ? "tab-active" : "")}
+              onClick={() => setActiveTab("logs")}
+            >
+              Logs
+            </button>
+          </div>
+        )}
+
+        {currentRole === "admin" && activeTab === "chat" ? (
           <section className="secrets-panel">
             <div className="secrets-head">
               <div>
@@ -1044,6 +1247,51 @@ export default function App() {
               {secrets.length === 0 && <div className="perm-empty">No secrets yet.</div>}
             </div>
           </section>
+        ) : currentRole === "admin" && activeTab === "logs" ? (
+          <section className="admin-log-stream playground-logs">
+            <div className="logs-header-row">
+              <div>
+                <span className="eyebrow">Agent log stream</span>
+                <h2>All agent activity</h2>
+              </div>
+              <span className="logs-count">{agentLogs.length} events</span>
+            </div>
+            <div className="audit-filter-row">
+              {(["all", "allow", "deny"] as const).map((filter) => (
+                <button
+                  key={filter}
+                  type="button"
+                  className={"audit-filter" + (auditFilter === filter ? " audit-filter-active" : "")}
+                  onClick={() => setAuditFilter(filter)}
+                >
+                  {filter}
+                </button>
+              ))}
+            </div>
+            <div className="admin-log-list">
+              {agentLogs
+                .filter((log) => auditFilter === "all" || log.decision === auditFilter)
+                .map((log) => (
+                  <button
+                    key={log.id}
+                    type="button"
+                    className={"log-list-item risk-row-" + log.riskLevel + (selectedLog?.id === log.id ? " log-list-item-selected" : "")}
+                    onClick={() => setSelectedLogId(log.id)}
+                  >
+                    <div className="log-list-top">
+                      <span className={"risk-badge risk-" + log.riskLevel}>{log.riskLevel}</span>
+                      <span className="log-list-time">{formatTime(log.timestamp)}</span>
+                    </div>
+                    <strong>{log.action}</strong>
+                    <span>{log.userId} · {log.agentName} · {log.resource}</span>
+                    <small>{log.detail}</small>
+                  </button>
+                ))}
+              {agentLogs.filter((log) => auditFilter === "all" || log.decision === auditFilter).length === 0 && (
+                <div className="empty-log-state">No matching logs.</div>
+              )}
+            </div>
+          </section>
         ) : selected ? (
           <>
             <header className="agent-header">
@@ -1085,6 +1333,23 @@ export default function App() {
                 </button>
               </div>
             </header>
+
+            <div className="agent-view-toggle" role="tablist" aria-label="Agent views">
+              <button
+                type="button"
+                className={"tab-button " + (activeTab === "chat" ? "tab-active" : "")}
+                onClick={() => setActiveTab("chat")}
+              >
+                Chat
+              </button>
+              <button
+                type="button"
+                className={"tab-button " + (activeTab === "logs" ? "tab-active" : "")}
+                onClick={() => setActiveTab("logs")}
+              >
+                Logs
+              </button>
+            </div>
 
             {showSettings && (
               <form className="settings-panel" onSubmit={saveAgent}>
@@ -1136,71 +1401,204 @@ export default function App() {
               </form>
             )}
 
-            <section className="playground">
-              <div className="playground-topbar">
+            <section className={"playground " + (activeTab === "logs" ? "playground-logs user-log-container" : "")}>
+              <div className={"playground-topbar " + (activeTab === "logs" ? "logs-topbar-hidden" : "")}>
                 <div>
                   <span className="eyebrow">Playground</span>
                   <h2>Build something with your Agent</h2>
                 </div>
-                <div className="session-info">
-                  <span className="pulse" />
-                  {selected.codexThreadId ? "Session connected" : "New session"}
+                <div className="playground-actions">
+                  <div className="session-info">
+                    <span className="pulse" />
+                    {selected.codexThreadId ? "Session connected" : "New session"}
+                  </div>
                 </div>
               </div>
 
               <div className="messages">
-                {messages.length === 0 && !activeRun ? (
-                  <div className="welcome">
-                    <div className="welcome-orbit">
-                      <div>⌁</div>
+                {activeTab === "chat" ? (
+                  <>
+                    {messages.length === 0 && !activeRun ? (
+                      <div className="welcome">
+                        <div className="welcome-orbit">
+                          <div>⌁</div>
+                        </div>
+                        <h3>What should {selected.name} build?</h3>
+                        <p>
+                          The Agent can inspect files, write code, run commands, and continue the
+                          same Codex session across messages.
+                        </p>
+                        <div className="prompt-grid">
+                          {starterPrompts.map((item) => (
+                            <button key={item} onClick={() => setPrompt(item)}>
+                              <span>↗</span>
+                              {item}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      messages.map((message) => (
+                        <article className={"message message-" + message.role} key={message.id}>
+                          <div className="message-meta">
+                            <strong>{message.role === "user" ? "You" : selected.name}</strong>
+                            <span>{formatTime(message.createdAt)}</span>
+                          </div>
+                          <div className="message-body">{message.content}</div>
+                        </article>
+                      ))
+                    )}
+                    {activeRun && ["queued", "running"].includes(activeRun.status) && (
+                      <article className="message message-assistant thinking">
+                        <div className="message-meta">
+                          <strong>{selected.name}</strong>
+                          <span>working in the Agent workspace</span>
+                        </div>
+                        <div className="thinking-row">
+                          <Spinner />
+                          Codex is reading, editing, or running commands…
+                        </div>
+                      </article>
+                    )}
+                    {runProgress.length > 0 && (
+                      <article className="message message-assistant" style={{ marginTop: 8 }}>
+                        <div className="message-meta">
+                          <strong>Progress</strong>
+                          <span>{runProgress.length} updates</span>
+                        </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                          {runProgress.map((item: { id: string; type: string; label: string; summary: string; detail?: string; timestamp: string }) => (
+                            <div
+                              key={item.id}
+                              style={{
+                                display: "grid",
+                                gridTemplateColumns: "12px minmax(0,1fr)",
+                                gap: 10,
+                                alignItems: "start",
+                                paddingLeft: 4,
+                              }}
+                            >
+                              <div
+                                style={{
+                                  width: 10,
+                                  height: 10,
+                                  borderRadius: "50%",
+                                  background: item.type.includes("command") || item.type.includes("validation")
+                                    ? "#a7d8ff"
+                                    : item.type.includes("file")
+                                      ? "#7fe3a5"
+                                      : "#ffd166",
+                                  marginTop: 5,
+                                  boxShadow: "0 0 0 3px rgba(255,255,255,.08)",
+                                }}
+                              />
+                              <div style={{ minWidth: 0 }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                                  <strong style={{ fontSize: 12 }}>{item.label}</strong>
+                                  <span style={{ fontSize: 10, opacity: 0.6 }}>{formatTime(item.timestamp)}</span>
+                                </div>
+                                <div style={{ fontSize: 12, opacity: 0.9, marginTop: 2 }}>{item.summary}</div>
+                                {item.detail && (
+                                  <div style={{ fontSize: 10, opacity: 0.7, marginTop: 3, wordBreak: "break-word" }}>
+                                    {item.detail}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </article>
+                    )}
+                    {activeRun?.status === "failed" && (
+                      <article className="run-error">
+                        <strong>Run failed</strong>
+                        <span>{activeRun.error}</span>
+                      </article>
+                    )}
+                    <div ref={messageEnd} />
+                  </>
+                ) : (
+                  <div className="logs-panel">
+                    <div className="logs-header-row">
+                      <div>
+                        <span className="eyebrow">Agent log stream</span>
+                        <h3>{selected.name}</h3>
+                      </div>
+                      <span className="logs-count">{agentLogs.length} events</span>
                     </div>
-                    <h3>What should {selected.name} build?</h3>
-                    <p>
-                      The Agent can inspect files, write code, run commands, and continue the
-                      same Codex session across messages.
-                    </p>
-                    <div className="prompt-grid">
-                      {starterPrompts.map((item) => (
-                        <button key={item} onClick={() => setPrompt(item)}>
-                          <span>↗</span>
-                          {item}
-                        </button>
-                      ))}
+                    <div className="logs-layout">
+                      <div className="logs-list-pane">
+                        {agentLogs.length === 0 ? (
+                          <div className="empty-log-state">No logs yet — start a run to populate the activity stream.</div>
+                        ) : (
+                          agentLogs.map((log) => (
+                            <button
+                              key={log.id}
+                              type="button"
+                              className={"log-list-item risk-row-" + log.riskLevel + (selectedLog?.id === log.id ? " log-list-item-selected" : "")}
+                              onClick={() => setSelectedLogId(log.id)}
+                            >
+                              <div className="log-list-top">
+                                <span className={"risk-badge risk-" + log.riskLevel}>{log.riskLevel}</span>
+                                <span className="log-list-time">{formatTime(log.timestamp)}</span>
+                              </div>
+                              <strong>{log.action}</strong>
+                              <span>{log.capability}</span>
+                              <small>{log.userId} · {log.resource} · {log.detail}</small>
+                            </button>
+                          ))
+                        )}
+                      </div>
+
+                      <aside className="log-detail-pane">
+                        {selectedLog ? (
+                          <>
+                            <div className="log-detail-header">
+                              <div>
+                                <span className="eyebrow">Activity Detail</span>
+                                <h4>{selectedLog.action}</h4>
+                              </div>
+                              <span className={"risk-badge risk-" + selectedLog.riskLevel}>{selectedLog.riskLevel}</span>
+                            </div>
+
+                            <div className="log-detail-card">
+                              <div className="log-detail-block">
+                                <label>Summary</label>
+                                <p>{selectedLog.summary}</p>
+                              </div>
+                              <div className="log-detail-grid">
+                                <div><label>User</label><strong>{selectedLog.userId}</strong></div>
+                                <div><label>Agent</label><strong>{selectedLog.agentName}</strong></div>
+                                <div><label>Resource</label><strong>{selectedLog.resource}</strong></div>
+                                <div><label>Scope</label><strong>{selectedLog.scope ?? "—"}</strong></div>
+                                <div><label>Time</label><strong>{formatDateTime(selectedLog.timestamp)}</strong></div>
+                                <div><label>Result</label><strong>{selectedLog.decision}</strong></div>
+                                <div><label>Capability</label><strong>{selectedLog.capability}</strong></div>
+                              </div>
+
+                              <div className="log-detail-block">
+                                <label>Details</label>
+                                <p>{selectedLog.detail}</p>
+                              </div>
+
+                              <div className="log-footer">
+                                {selectedLog.runId && <span>Run {selectedLog.runId.slice(0, 8)}</span>}
+                                {selectedLog.agentId && <span>Agent {selectedLog.agentId.slice(0, 8)}</span>}
+                                <span>{selectedLog.decision === "info" ? selectedLog.status?.toUpperCase() ?? "INFO" : selectedLog.decision.toUpperCase()}</span>
+                              </div>
+                            </div>
+                          </>
+                        ) : (
+                          <div className="empty-log-state">Select a log item to inspect the details.</div>
+                        )}
+                      </aside>
                     </div>
                   </div>
-                ) : (
-                  messages.map((message) => (
-                    <article className={"message message-" + message.role} key={message.id}>
-                      <div className="message-meta">
-                        <strong>{message.role === "user" ? "You" : selected.name}</strong>
-                        <span>{formatTime(message.createdAt)}</span>
-                      </div>
-                      <div className="message-body">{message.content}</div>
-                    </article>
-                  ))
                 )}
-                {activeRun && ["queued", "running"].includes(activeRun.status) && (
-                  <article className="message message-assistant thinking">
-                    <div className="message-meta">
-                      <strong>{selected.name}</strong>
-                      <span>working in the Agent workspace</span>
-                    </div>
-                    <div className="thinking-row">
-                      <Spinner />
-                      Codex is reading, editing, or running commands…
-                    </div>
-                  </article>
-                )}
-                {activeRun?.status === "failed" && (
-                  <article className="run-error">
-                    <strong>Run failed</strong>
-                    <span>{activeRun.error}</span>
-                  </article>
-                )}
-                <div ref={messageEnd} />
               </div>
 
-              <form className="composer" onSubmit={sendMessage}>
+              {activeTab === "chat" && (
+                <form className="composer" onSubmit={sendMessage}>
                 <textarea
                   value={prompt}
                   onChange={(event) => setPrompt(event.target.value)}
@@ -1222,24 +1620,25 @@ export default function App() {
                   }
                   rows={3}
                 />
-                <div className="composer-footer">
-                  <span>
-                    Enter to send · Shift + Enter for newline · {system?.codexSandboxMode ?? "checking sandbox"}
-                  </span>
-                  <button
-                    className="send-button"
-                    disabled={
-                      !prompt.trim() ||
-                      selected.status === "stopped" ||
-                      selected.status === "busy" ||
-                      (activeRun != null && ["queued", "running"].includes(activeRun.status))
-                    }
-                    aria-label="Send message"
-                  >
-                    ↑
-                  </button>
-                </div>
-              </form>
+                  <div className="composer-footer">
+                    <span>
+                      Enter to send · Shift + Enter for newline · {system?.codexSandboxMode ?? "checking sandbox"}
+                    </span>
+                    <button
+                      className="send-button"
+                      disabled={
+                        !prompt.trim() ||
+                        selected.status === "stopped" ||
+                        selected.status === "busy" ||
+                        (activeRun != null && ["queued", "running"].includes(activeRun.status))
+                      }
+                      aria-label="Send message"
+                    >
+                      ↑
+                    </button>
+                  </div>
+                </form>
+              )}
             </section>
           </>
         ) : (
@@ -1264,9 +1663,80 @@ export default function App() {
         )}
       </main>
 
-      {currentRole !== "admin" && (
+      {(activeTab === "logs" || currentRole !== "admin") && (
       <aside className="policy-console">
-        {selected ? (
+        {activeTab === "logs" ? (
+          <div className="focused-logs">
+            <div className="logs-header-row">
+              <div>
+                <span className="eyebrow">Log stream</span>
+                <h3>{currentRole === "admin" ? "All agent activity" : selected?.name ?? "Agent activity"}</h3>
+              </div>
+              <span className="logs-count">{agentLogs.length} events</span>
+            </div>
+            <div className="audit-filter-row">
+              {(["all", "allow", "deny"] as const).map((filter) => (
+                <button
+                  key={filter}
+                  type="button"
+                  className={"audit-filter" + (auditFilter === filter ? " audit-filter-active" : "")}
+                  onClick={() => setAuditFilter(filter)}
+                >
+                  {filter}
+                </button>
+              ))}
+            </div>
+            <div className="focused-log-list">
+              {agentLogs
+                .filter((log) => auditFilter === "all" || log.decision === auditFilter)
+                .map((log) => (
+                  <button
+                    key={log.id}
+                    type="button"
+                    className={"focused-log risk-row-" + log.riskLevel + (selectedLog?.id === log.id ? " focused-log-selected" : "")}
+                    onClick={() => setSelectedLogId(log.id)}
+                  >
+                    <span className="focused-log-status">{log.decision}</span>
+                    <strong>{log.action}</strong>
+                    <span>{log.userId} · {log.agentName} · {log.resource}</span>
+                    <small>{log.detail}</small>
+                    <time>{formatTime(log.timestamp)}</time>
+                  </button>
+                ))}
+              {agentLogs.filter((log) => auditFilter === "all" || log.decision === auditFilter).length === 0 && (
+                <div className="empty-log-state">No matching logs.</div>
+              )}
+            </div>
+            {selectedLog && (
+              <div className="focused-log-detail">
+                <div className="log-detail-header">
+                  <div>
+                    <span className="eyebrow">Activity Detail</span>
+                    <h4>{selectedLog.action}</h4>
+                  </div>
+                  <span className={"risk-badge risk-" + selectedLog.riskLevel}>{selectedLog.riskLevel}</span>
+                </div>
+                <div className="log-detail-block">
+                  <label>Summary</label>
+                  <p>{selectedLog.summary}</p>
+                </div>
+                <div className="log-detail-grid">
+                  <div><label>User</label><strong>{selectedLog.userId}</strong></div>
+                  <div><label>Agent</label><strong>{selectedLog.agentName}</strong></div>
+                  <div><label>Resource</label><strong>{selectedLog.resource}</strong></div>
+                  <div><label>Scope</label><strong>{selectedLog.scope ?? "—"}</strong></div>
+                  <div><label>Time</label><strong>{formatDateTime(selectedLog.timestamp)}</strong></div>
+                  <div><label>Result</label><strong>{selectedLog.decision}</strong></div>
+                  <div><label>Capability</label><strong>{selectedLog.capability}</strong></div>
+                </div>
+                <div className="log-detail-block">
+                  <label>Details</label>
+                  <p>{selectedLog.detail}</p>
+                </div>
+              </div>
+            )}
+          </div>
+        ) : currentRole !== "admin" && selected ? (
           <>
             <div className="policy-tabs">
               {POLICY_TABS.map((tab) => (
@@ -1394,74 +1864,6 @@ export default function App() {
                   ))}
                   {secrets.length === 0 && (
                     <div className="perm-empty">No secrets registered yet.</div>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {policyTab === "decisions" && (
-              <div className="policy-section">
-                <div className="playground-topbar" style={{ marginBottom: 4 }}>
-                  <div>
-                    <span className="eyebrow">Decisions</span>
-                  </div>
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                    {(["all", "allow", "deny"] as const).map((f) => (
-                      <button
-                        key={f}
-                        type="button"
-                        className={"audit-filter" + (auditFilter === f ? " audit-filter-active" : "")}
-                        onClick={() => setAuditFilter(f)}
-                      >
-                        {f}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  {audit
-                    .filter((row) => auditFilter === "all" || row.decision === auditFilter)
-                    .map((row) => (
-                      <div
-                        key={row.id}
-                        className={"audit-row" + (row.decision === "deny" ? " audit-deny" : "")}
-                        onClick={() =>
-                          setExpandedAuditId(expandedAuditId === row.id ? null : row.id)
-                        }
-                      >
-                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <span
-                            className={"mini-dot mini-" + (row.decision === "allow" ? "ready" : "error")}
-                          />
-                          <strong style={{ fontSize: 10, textTransform: "uppercase" }}>
-                            {row.decision}
-                          </strong>
-                          <code
-                            style={{
-                              fontSize: 11,
-                              flex: 1,
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              whiteSpace: "nowrap",
-                            }}
-                          >
-                            {row.method ?? "—"} {row.resource}
-                          </code>
-                          <span style={{ fontSize: 10, opacity: 0.5 }}>
-                            {formatTime(row.timestamp)}
-                          </span>
-                        </div>
-                        {expandedAuditId === row.id && (
-                          <div style={{ marginTop: 4, fontSize: 11, opacity: 0.7 }}>
-                            <div>scope: {row.scope ?? "—"}</div>
-                            <div>reason: {row.reason}</div>
-                            {row.runId && <div>run: {row.runId.slice(0, 8)}</div>}
-                          </div>
-                        )}
-                      </div>
-                    ))}
-                  {audit.length === 0 && (
-                    <div className="perm-empty">No decisions yet — send a prompt.</div>
                   )}
                 </div>
               </div>

@@ -38,6 +38,9 @@ export interface AgentRun {
     cachedInputTokens?: number;
     outputTokens?: number;
   } | null;
+  progress: AgentProgressEvent[];
+  startedAt: string | null;
+  completedAt: string | null;
   createdAt: string;
 }
 
@@ -61,6 +64,15 @@ export interface Audit {
   /** Workflow hierarchy tracking (Phase 1 enhancement). */
   nodeId?: string;
   parentNodeId?: string;
+}
+
+export interface AgentProgressEvent {
+  id: string;
+  type: string;
+  label: string;
+  summary: string;
+  detail?: string;
+  timestamp: string;
 }
 
 export type RiskLevel = "low" | "medium" | "high";
