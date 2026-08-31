@@ -9,6 +9,7 @@ import { JsonStore } from "./store.js";
 import type {
   Agent,
   AgentCredential,
+  AgentProgressEvent,
   AgentRun,
   AgentRunner,
   Audit,
@@ -634,6 +635,13 @@ export class AgentService {
       }
       const result = await this.runner.run(request);
       const completedAt = now();
+      const responseReadyEvent: AgentProgressEvent = {
+        id: `response-${run.id}`,
+        type: "response_ready",
+        label: "Response ready",
+        summary: "Codex returned a response to the user.",
+        timestamp: completedAt,
+      };
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
@@ -641,8 +649,20 @@ export class AgentService {
         storedRun.status = "completed";
         storedRun.output = result.output;
         storedRun.usage = result.usage;
-        storedRun.progress = [...(storedRun.progress ?? []), ...(result.progress ?? [])];
+        const progress = [...(storedRun.progress ?? [])];
+        for (const event of [...(result.progress ?? []), responseReadyEvent]) {
+          if (!progress.some((existing) => existing.id === event.id)) {
+            progress.push(event);
+          }
+        }
+        storedRun.progress = progress;
         storedRun.completedAt = completedAt;
+        for (const node of database.workflowNodes) {
+          if (node.runId === run.id && node.status === "running") {
+            node.status = "completed";
+            node.completedAt = completedAt;
+          }
+        }
         database.messages.push({
           id: randomUUID(),
           agentId: agent.id,
@@ -667,6 +687,12 @@ export class AgentService {
           storedRun.status = cancelled ? "cancelled" : "failed";
           storedRun.error = message;
           storedRun.completedAt = completedAt;
+        }
+        for (const node of database.workflowNodes) {
+          if (node.runId === run.id && node.status === "running") {
+            node.status = "failed";
+            node.completedAt = completedAt;
+          }
         }
         if (agent) {
           if (agent.status !== "stopped") {
@@ -703,10 +729,14 @@ export class AgentService {
     reason: string,
     options: { runId?: string; method?: string; scope?: string; agentPrincipalId?: string } = {},
   ): Promise<void> {
+    const agentName = agentId
+      ? this.store.snapshot().agents.find((agent) => agent.id === agentId)?.name ?? null
+      : null;
     await this.mockResourceService.writeAudit({
       humanPrincipalId: principal.id,
       agentId,
       agentPrincipalId: options.agentPrincipalId ?? null,
+      agentName,
       runId: options.runId ?? null,
       method: options.method ?? null,
       action,

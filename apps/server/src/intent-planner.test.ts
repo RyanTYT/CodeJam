@@ -49,9 +49,18 @@ describe("IntentPlanner (fallback — Ark is not configured in tests)", () => {
     expect(plan.elevatedScopes).toContain("act:deploy:prod");
   });
 
-  it("defaults to reading the first secret when no keyword matches", async () => {
+  it("does not grant a secret when the intent does not name one", async () => {
     const plan = await planner.plan("hello world", ["dev-db-url", "prod-db-url"]);
-    expect(plan.requestedScopes).toContain("read:secrets:dev-db-url");
+    expect(plan.requestedScopes).toEqual([]);
+  });
+
+  it("does not infer production access from a negative instruction", async () => {
+    const plan = await planner.plan(
+      "read alice/db-url but do not access production and do not deploy anything",
+      ["alice/db-url", "prod/db-url"],
+    );
+    expect(plan.baselineScopes).toEqual(["read:secrets:alice/db-url"]);
+    expect(plan.elevatedScopes).toEqual([]);
   });
 
   it("never grants a scope the taxonomy doesn't know", async () => {

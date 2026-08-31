@@ -160,51 +160,41 @@ export function calculateAgentRiskProfile(agent: Agent, recentAudit: Audit[]): A
 }
 
 /**
- * Assesses operation-level risk for a single request
- * 40% scope intersection + 40% audit context + 20% authority check
+ * Assesses operation-level risk for a single authorized request.
+ * Risk is based on the required IAM scope, audit history, and the sensitivity
+ * of the permitted action. A normal Codex command is not an IAM operation and
+ * must not be assessed here.
  */
 export function assessOperationRisk(
   agent: Agent,
   agentProfile: AgentRiskProfile,
   requestedResource: string,
-  requestedMethod: string,
+  requiredScope: string,
   recentAudit: Audit[]
 ): OperationRiskAssessment {
-  // 1. Scope intersection risk (40%)
-  // How much does the requested resource overlap with agent's authorized scopes?
-  let scopeIntersectionRisk = 0;
-
-  if (agent.scopes && agent.scopes.length > 0) {
-    const matchesScope = agent.scopes.some((scope) => {
-      // Simple matching: exact match or wildcard match
-      if (scope === "*") return true;
-      if (scope === requestedResource) return true;
-
-      // Wildcard matching (e.g., "users/*" matches "users/123")
-      const scopePattern = scope.replace(/\*/g, ".*");
-      const regex = new RegExp(`^${scopePattern}$`);
-      return regex.test(requestedResource);
-    });
-
-    if (!matchesScope) {
-      scopeIntersectionRisk = 95; // Requested resource outside scopes = very high risk
-    } else {
-      // Resource is in scope but we still evaluate breadth
-      // Wide scopes (wildcards) are higher risk for any single operation
-      const hasWildcard = agent.scopes.some((s) => s.includes("*"));
-      scopeIntersectionRisk = hasWildcard ? 35 : 15;
-    }
-  } else {
-    scopeIntersectionRisk = 100; // No scopes at all = maximum risk
+  // 1. Requested permission risk (60%). Compare scopes to scopes, rather than
+  // comparing a scope such as `read:secrets:dev-db-url` with the resource
+  // string `secrets:dev-db-url`.
+  const matchingScopes = (agent.scopes ?? []).filter(
+    (scope) => scope === "*" || requiredScope === scope || requiredScope.startsWith(scope + "/"),
+  );
+  const hasMatchingScope = matchingScopes.length > 0;
+  const hasWildcard = matchingScopes.some((scope) => scope.includes("*"));
+  let scopeIntersectionRisk = 100;
+  if (hasMatchingScope) {
+    if (requiredScope === "act:deploy:prod") scopeIntersectionRisk = 90;
+    else if (requiredScope.startsWith("write:")) scopeIntersectionRisk = 55;
+    else if (hasWildcard) scopeIntersectionRisk = 35;
+    else scopeIntersectionRisk = 5;
   }
 
-  // 2. Audit context risk (40%)
+  // 2. Audit context risk (20%)
   // Is there suspicious pattern in this agent's recent audit trail?
   let auditContextRisk = 0;
 
   const agentAudit = recentAudit.filter((a) => a.agentId === agent.id);
   if (agentAudit.length === 0) {
-    auditContextRisk = 20; // New agent, neutral risk
+    auditContextRisk = 0; // No suspicious history yet
   } else {
     const recentWindow = 1000 * 60 * 15; // 15 minutes
     const now = Date.now();
@@ -232,32 +222,30 @@ export function assessOperationRisk(
 
   auditContextRisk = Math.min(auditContextRisk, 100);
 
-  // 3. Authority check risk (20%)
-  // Does the agent have proper authority for this operation?
-  let authorityCheckRisk = 0;
-
-  // Check if operation type (GET/POST/DELETE) matches scope permissions
-  const scopesStr = (agent.scopes || []).join(" ").toLowerCase();
-  const isWriteOp = ["post", "put", "patch", "delete"].includes(requestedMethod.toLowerCase());
-  const hasWritePermission = scopesStr.includes("write") || scopesStr.includes("update") || scopesStr.includes("delete");
-
-  if (isWriteOp && !hasWritePermission && scopesStr.includes("read")) {
-    authorityCheckRisk = 85; // Read-only agent attempting write = high risk
-  } else if (isWriteOp && hasWritePermission) {
-    authorityCheckRisk = 15; // Write operation with write permission = low risk
-  } else if (!isWriteOp) {
-    authorityCheckRisk = 10; // Read operation = low risk generally
+  // 3. Authority check risk (20%). The relay has already made the real policy
+  // decision; this score records how sensitive that allowed authority is.
+  let authorityCheckRisk = hasMatchingScope ? 5 : 100;
+  if (hasMatchingScope && requiredScope === "act:deploy:prod") {
+    authorityCheckRisk = 80;
+  } else if (hasMatchingScope && requiredScope.startsWith("write:")) {
+    authorityCheckRisk = 40;
   }
 
-  // Combined operation risk score: 40% scope + 40% audit context + 20% authority
+  // Combined operation risk score: 60% requested permission + 20% audit
+  // context + 20% authority sensitivity.
   const operationRiskScore = Math.round(
-    scopeIntersectionRisk * 0.4 + auditContextRisk * 0.4 + authorityCheckRisk * 0.2
+    scopeIntersectionRisk * 0.6 + auditContextRisk * 0.2 + authorityCheckRisk * 0.2
   );
 
   const operationRiskFactors: string[] = [];
-  if (scopeIntersectionRisk > 50) operationRiskFactors.push("resource outside authorized scopes");
+  if (!hasMatchingScope) operationRiskFactors.push("required scope was not granted");
+  else if (requiredScope === "act:deploy:prod") operationRiskFactors.push("production deployment");
+  else if (requiredScope.startsWith("write:")) operationRiskFactors.push("write permission");
+  else if (hasWildcard) operationRiskFactors.push("wildcard scope");
   if (auditContextRisk > 50) operationRiskFactors.push("suspicious audit pattern");
-  if (authorityCheckRisk > 50) operationRiskFactors.push("operation type not authorized");
+  if (authorityCheckRisk > 50 && requiredScope === "act:deploy:prod") {
+    operationRiskFactors.push("high-impact authority");
+  }
 
   const operationRiskLevel = scoreToLevel(operationRiskScore);
   const requiresApproval = operationRiskLevel === "high" || operationRiskScore > 75;

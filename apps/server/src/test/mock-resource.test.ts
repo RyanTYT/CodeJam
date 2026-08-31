@@ -3,7 +3,7 @@ import path from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../config.js";
-import { AuthorizationContext } from "../types.js";
+import type { Agent, AuthorizationContext } from "../types.js";
 import { createMockApp } from "../mock-resource-server.js";
 import { MockResourceService } from "../mock-resource-service.js";
 import { JsonStore } from "../store.js";
@@ -44,6 +44,21 @@ const bodyValue = (body: unknown): string =>
     : "";
 
 describe("boundary 3 — relay policy", () => {
+  it("migrates legacy plaintext resource values before serving them", async () => {
+    const { service, store } = await makeService();
+    await store.mutate((db) => {
+      const resource = db.mockResources.find((entry) => entry.key === "dev-db-url");
+      if (!resource) throw new Error("expected seeded resource");
+      resource.value = "legacy-plaintext-value";
+    });
+
+    await service.initialize();
+
+    expect(
+      store.snapshot().mockResources.find((entry) => entry.key === "dev-db-url")?.value,
+    ).toMatch(/^v1:/);
+  });
+
   it("allows a scoped read, returns the redacted view, and audits allow", async () => {
     const { service, store } = await makeService();
     const { token } = await service.mintCredential("agent-1", "run-1", "alice", [
@@ -83,6 +98,38 @@ describe("boundary 3 — relay policy", () => {
       .listAudit("agent-1")
       .find((row) => row.decision === "deny" && row.reason === "capability not granted");
       expect(deny).toBeTruthy();
+  });
+
+  it("assesses a denied production deployment as high risk when the Agent is known", async () => {
+    const { service, store } = await makeService();
+    const agent: Agent = {
+      id: "agent-1",
+      name: "Development deployer",
+      description: "",
+      instructions: "",
+      status: "ready",
+      ownerId: "alice",
+      scopes: ["act:deploy:dev"],
+      plan: null,
+      workspacePath: "/tmp/agent-1",
+      codexThreadId: null,
+      lastError: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    await store.mutate((db) => {
+      db.agents.push(agent);
+    });
+    const { token } = await service.mintCredential("agent-1", "run-1", "alice", ["act:deploy:dev"]);
+
+    const result = await service.relay("POST", "deploy/prod", {}, token);
+
+    expect(result.status).toBe(403);
+    const denial = service.listAudit("agent-1").find((entry) => entry.reason === "capability not granted");
+    expect(denial).toMatchObject({
+      operationRiskLevel: "high",
+      operationRiskFactors: expect.arrayContaining(["required scope was not granted"]),
+    });
   });
 
   it("denies a revoked credential with 401 and audits the denial", async () => {

@@ -106,6 +106,42 @@ describe("Agent lifecycle", () => {
     expect(service.getAgent(agent.id).codexThreadId).toBe("fake-thread");
   });
 
+  it("stores each Codex progress event once and records when the response is ready", async () => {
+    const event = {
+      id: "progress-1",
+      type: "command_execution",
+      label: "Command",
+      summary: "Ran command",
+      detail: "Command: npm test",
+      timestamp: new Date().toISOString(),
+    };
+    const runner: AgentRunner = {
+      run: async (request) => {
+        await request.onProgress?.(event);
+        return {
+          output: "Done.",
+          threadId: "progress-thread",
+          usage: null,
+          progress: [event],
+        };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const service = await makeService(runner);
+    const agent = await service.createAgent({ name: "Progress" });
+    const { run } = await service.sendMessage(agent.id, "run tests");
+
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    const progress = service.getRun(run.id).progress;
+    expect(progress.filter((item) => item.id === event.id)).toHaveLength(1);
+    expect(progress).toContainEqual(expect.objectContaining({
+      id: `response-${run.id}`,
+      type: "response_ready",
+      label: "Response ready",
+    }));
+  });
+
   it("tracks workflow hierarchy and risk snapshots for a run", async () => {
     const service = await makeService();
     const agent = await service.createAgent({ name: "Workflow" });
@@ -115,6 +151,7 @@ describe("Agent lifecycle", () => {
     const workflow = service.getWorkflow(run.id);
     expect(workflow.some((node) => node.type === "orchestrator")).toBe(true);
     expect(workflow.some((node) => node.type === "task" && node.agentId === agent.id)).toBe(true);
+    expect(workflow.every((node) => node.status === "completed" && node.completedAt)).toBe(true);
     expect(workflow.every((node) => node.riskLevel === "low" || node.riskLevel === "medium" || node.riskLevel === "high")).toBe(true);
   });
 

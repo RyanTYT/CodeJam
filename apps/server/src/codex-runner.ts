@@ -49,6 +49,16 @@ export function buildCodexArgs(
   return args;
 }
 
+function safeActivityText(value: string, maxLength = 240): string {
+  return value
+    .replace(/\b(?:sk|rk|ark)-[A-Za-z0-9_-]{8,}\b/gi, "[redacted]")
+    .replace(/\b(api[_-]?key|token|password|secret)\s*=\s*(?:"[^"]*"|'[^']*'|\S+)/gi, "$1=[redacted]")
+    .replace(/(postgres(?:ql)?:\/\/[^:\s]+:)[^@\s]+@/gi, "$1[redacted]@")
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [redacted]")
+    .trim()
+    .slice(0, maxLength);
+}
+
 function maybeCaptureProgressEvent(
   parsed: ParsedEvents,
   item: Record<string, unknown>,
@@ -67,25 +77,28 @@ function maybeCaptureProgressEvent(
   };
   const label = typeMap[type] ??
     (type.includes("file") ? "File action" : type.includes("command") ? "Command" : "Activity");
-  const summary =
-    typeof item.summary === "string"
-      ? item.summary
-      : typeof item.text === "string"
-        ? item.text
-        : typeof item.command === "string"
-          ? item.command
-          : typeof item.path === "string"
-            ? `Touched ${item.path}`
-            : type;
-  const detail =
-    typeof item.path === "string" && item.path.length > 0
-      ? item.path
-      : typeof item.command === "string" && item.command.length > 0
-        ? item.command
-        : typeof item.output === "string" && item.output.length > 0
-          ? item.output.slice(0, 200)
-          : undefined;
   if (type === "agent_message") return;
+  const explicitSummary = typeof item.summary === "string"
+    ? safeActivityText(item.summary)
+    : typeof item.text === "string"
+      ? safeActivityText(item.text)
+      : undefined;
+  const command = typeof item.command === "string" && item.command.length > 0
+    ? safeActivityText(item.command)
+    : undefined;
+  const path = typeof item.path === "string" && item.path.length > 0
+    ? safeActivityText(item.path)
+    : undefined;
+  const output = typeof item.output === "string" && item.output.length > 0
+    ? safeActivityText(item.output, 160)
+    : undefined;
+  const isCommand = ["command_execution", "command", "code_execution", "validation"].includes(type);
+  const summary = isCommand
+    ? explicitSummary && explicitSummary !== command ? explicitSummary : "Ran command"
+    : explicitSummary ?? (path ? `Touched ${path}` : type);
+  const detail = isCommand
+    ? [command && `Command: ${command}`, output && `Output: ${output}`].filter(Boolean).join("\n") || undefined
+    : path && path !== summary ? path : undefined;
   const event: {
     id: string;
     type: string;

@@ -19,6 +19,224 @@ const emptyForm = {
 
 const POLICY_TABS = ["permissions", "vault", "owner"] as const;
 type PolicyTab = (typeof POLICY_TABS)[number];
+type ActivityRiskLevel = "low" | "medium" | "high" | "observed";
+type ActivitySource = "access" | "lifecycle" | "workflow" | "runtime" | "response";
+type ActivityLog = {
+  id: string;
+  timestamp: string;
+  agentId: string | null;
+  agentName: string;
+  agentPrincipalId: string | null;
+  runId: string | null;
+  userId: string;
+  summary: string;
+  action: string;
+  source: ActivitySource;
+  resource: string;
+  scope: string | null;
+  method: string | null;
+  riskLevel: ActivityRiskLevel;
+  riskScore: number | null;
+  riskFactors: string[];
+  decision: "allow" | "deny" | "info";
+  detail: string;
+  status?: string;
+  runStatus?: AgentRun["status"];
+};
+
+type ActivityRunGroup = {
+  id: string;
+  runId: string | null;
+  label: string;
+  prompt: string | null;
+  status: string | null;
+  allowCount: number;
+  denyCount: number;
+  logs: ActivityLog[];
+  latestTimestamp: string;
+};
+
+function formatRiskLabel(value: ActivityRiskLevel): string {
+  return value;
+}
+
+function activitySourceLabel(source: ActivitySource): string {
+  if (source === "access") return "Protected access";
+  if (source === "lifecycle") return "Agent management";
+  if (source === "workflow") return "Run status";
+  if (source === "response") return "Response delivered";
+  return "Agent work";
+}
+
+function activityStatusLabel(log: ActivityLog): string {
+  if (log.source === "response") return "Completed";
+  if (log.source === "workflow") {
+    if (log.status === "running") return "In progress";
+    if (log.status === "failed") return "Failed";
+    return "Completed";
+  }
+  if (log.source === "runtime" && log.resource === "error") {
+    return log.runStatus === "completed" ? "Recovered" : "Warning";
+  }
+  return "Observed";
+}
+
+function permissionDescription(log: ActivityLog): string {
+  if (log.scope?.startsWith("read:secrets:")) return "Read this protected configuration";
+  if (log.scope?.startsWith("write:secrets:")) return "Update this protected configuration";
+  if (log.scope === "act:deploy:dev") return "Deploy to the development environment";
+  if (log.scope === "act:deploy:prod") return "Deploy to the production environment";
+  return log.scope ?? "—";
+}
+
+function authorizationReason(log: ActivityLog): string {
+  if (log.detail === "owner") {
+    return `${log.userId} owns this Agent and is allowed to manage it.`;
+  }
+  if (log.detail === "scope match") {
+    return "The Agent has the approved permission needed for this resource.";
+  }
+  if (log.detail === "capability not granted") {
+    return "This Agent was not given the permission required for this action.";
+  }
+  if (log.detail === "not owner") {
+    return "The signed-in user does not own this Agent.";
+  }
+  if (log.detail === "invalid or revoked token") {
+    return "The Agent credential is no longer valid.";
+  }
+  if (log.detail === "missing token") {
+    return "The request did not include an Agent credential.";
+  }
+  return log.detail;
+}
+
+function activityPreview(log: ActivityLog): string {
+  if (log.source === "access" || log.source === "lifecycle") {
+    return authorizationReason(log);
+  }
+  if (log.source === "runtime" && log.resource === "error") {
+    return activitySummary(log);
+  }
+  return log.source === "response" ? log.summary : log.detail;
+}
+
+function activitySummary(log: ActivityLog): string {
+  if (log.source === "lifecycle" && log.action === "send") {
+    return `${log.userId} started a new run for ${log.agentName}.`;
+  }
+  if (log.source === "access") {
+    const outcome = log.decision === "allow" ? "allowed" : "blocked";
+    return `The Agent requested ${describeProtectedResource(log.resource)}. IAM ${outcome} the request.`;
+  }
+  if (log.source === "runtime" && log.resource === "error") {
+    return log.runStatus === "completed"
+      ? "The runtime reported an issue, but the Agent completed this request."
+      : "The runtime reported an issue while the Agent was handling this request.";
+  }
+  return log.summary;
+}
+
+function decisionOutcomeLabel(log: ActivityLog): string {
+  if (log.source === "lifecycle") return log.decision === "allow" ? "Passed" : "Blocked";
+  return log.decision === "allow" ? "Allowed" : "Blocked";
+}
+
+function activityOutcomeLabel(log: ActivityLog): string {
+  if (log.source === "access") return decisionOutcomeLabel(log);
+  if (log.source === "lifecycle") return log.decision === "allow" ? "Ownership confirmed" : "Ownership blocked";
+  if (log.source === "response") return "Completed";
+  if (log.source === "runtime" && log.resource === "error") {
+    return log.runStatus === "completed" ? "Recovered" : "Runtime warning";
+  }
+  if (log.source === "workflow") return activityStatusLabel(log);
+  return "Observed";
+}
+
+function activityOutcomeClass(log: ActivityLog): string {
+  if (log.source === "access") return log.decision === "allow" ? "outcome-allowed" : "outcome-blocked";
+  if (log.source === "runtime" && log.resource === "error") {
+    return log.runStatus === "completed" ? "outcome-recovered" : "outcome-warning";
+  }
+  if (log.source === "response") return "outcome-completed";
+  return "outcome-observed";
+}
+
+function runtimeWarningExplanation(log: ActivityLog): string {
+  return log.runStatus === "completed"
+    ? "Codex reported a tool issue, but later steps completed and the Agent returned a response. Check the command and protected-access events in this run for the final outcome."
+    : "Codex reported a tool issue while handling this request. Review the command events and run status for more detail.";
+}
+
+function commandFromDetail(detail: string): string | null {
+  const match = /^Command:\s*([\s\S]*?)(?:\nOutput:|$)/.exec(detail);
+  return match?.[1]?.trim() || null;
+}
+
+function outputFromCommandDetail(detail: string): string | null {
+  const match = /\nOutput:\s*([\s\S]*)$/.exec(detail);
+  return match?.[1]?.trim() || null;
+}
+
+function shortenPrompt(prompt: string): string {
+  const compact = prompt.replace(/\s+/g, " ").trim();
+  return compact.length > 100 ? compact.slice(0, 100) + "…" : compact;
+}
+
+function describeProtectedResource(resource: string): string {
+  if (resource.startsWith("secrets:")) {
+    return `the ${resource.slice("secrets:".length)} protected configuration`;
+  }
+  if (resource.startsWith("deploy:")) {
+    return `the ${resource.slice("deploy:".length)} deployment`;
+  }
+  return resource;
+}
+
+function activityActionLabel(log: ActivityLog): string {
+  if (log.source === "access") {
+    const outcome = log.decision === "allow" ? "allowed" : "blocked";
+    if (log.action === "read") return `Protected configuration access ${outcome}`;
+    if (log.action === "write") return `Protected data update ${outcome}`;
+    if (log.action === "act") return `Protected action ${outcome}`;
+    return `Protected resource request ${outcome}`;
+  }
+  if (log.source === "lifecycle") {
+    if (log.action === "send") return "User started this Agent run";
+    if (log.action === "create") return "Agent created";
+    if (log.action === "revoke") return "Agent credential revoked";
+    if (log.action === "revoke-scope") return "Agent permission revoked";
+    if (log.action === "start") return "Agent started";
+    if (log.action === "stop") return "Agent stopped";
+    return "Agent lifecycle updated";
+  }
+  if (log.source === "workflow") {
+    if (log.resource === "orchestrator") return log.status === "completed" ? "Run completed" : "Run started";
+    return log.status === "completed" ? "Agent task completed" : "Agent task running";
+  }
+  if (log.source === "response") return "Agent returned a response";
+  if (log.resource === "error") return "Runtime warning";
+  if (log.action === "Reasoning") return "Agent planned the next step";
+  if (log.action === "Command") return "Agent ran a workspace command";
+  if (log.action === "File edit") return "Agent updated a file";
+  if (log.action === "File search") return "Agent searched the workspace";
+  if (log.action === "Validation") return "Agent validated its work";
+  return "Agent runtime activity";
+}
+
+function groupOutcomeSummary(group: ActivityRunGroup): string {
+  const denied = group.logs.find((log) => log.source === "access" && log.decision === "deny");
+  if (denied) {
+    return `The Agent requested ${describeProtectedResource(denied.resource)}. IAM blocked it because the required permission was not granted.`;
+  }
+  const allowed = group.logs.find((log) => log.source === "access" && log.decision === "allow");
+  if (allowed) {
+    return `IAM allowed the Agent to access ${describeProtectedResource(allowed.resource)} with its approved permission.`;
+  }
+  if (group.status === "completed") return "The Agent completed this user request without protected-resource access.";
+  if (group.status === "failed") return "The Agent could not complete this user request.";
+  return "This contains Agent setup and lifecycle activity.";
+}
 
 function formatTime(value: string): string {
   return new Intl.DateTimeFormat(undefined, {
@@ -107,6 +325,7 @@ export default function App() {
   const [form, setForm] = useState(emptyForm);
   const [prompt, setPrompt] = useState("");
   const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
+  const [runs, setRuns] = useState<AgentRun[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [authRequired, setAuthRequired] = useState<boolean | null>(null);
@@ -144,6 +363,8 @@ export default function App() {
   const [adminPerm, setAdminPerm] = useState<string | null>(null);
   const [selectedWorkflowNodeId, setSelectedWorkflowNodeId] = useState<string | null>(null);
   const [selectedLogId, setSelectedLogId] = useState<string | null>(null);
+  const [logCopied, setLogCopied] = useState(false);
+  const [expandedRunGroupIds, setExpandedRunGroupIds] = useState<Set<string>>(new Set());
   const messageEnd = useRef<HTMLDivElement>(null);
   const selectedIdRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
@@ -205,31 +426,36 @@ export default function App() {
     return { groups, riskMap };
   }, [secrets]);
 
-  const runProgress = useMemo(
-    () => activeRun?.progress ?? [],
-    [activeRun],
-  );
+  const runProgress = useMemo(() => {
+    const seen = new Set<string>();
+    return (activeRun?.progress ?? []).filter((event) => {
+      if (seen.has(event.id)) return false;
+      seen.add(event.id);
+      return true;
+    });
+  }, [activeRun]);
+
+  const loggedRunProgress = useMemo(() => {
+    const seen = new Set<string>();
+    return runs.flatMap((run) =>
+      (run.progress ?? []).map((event) => ({
+        ...event,
+        id: `${run.id}:${event.id}`,
+        runId: run.id,
+        output: run.output,
+        runStatus: run.status,
+      })),
+    ).filter((event) => {
+      if (seen.has(event.id)) return false;
+      seen.add(event.id);
+      return true;
+    });
+  }, [runs]);
 
   const agentLogs = useMemo(() => {
-    const items: Array<{
-      id: string;
-      timestamp: string;
-      agentId: string | null;
-      agentName: string;
-      runId: string | null;
-      userId: string;
-      summary: string;
-      action: string;
-      capability: string;
-      resource: string;
-      scope: string | null;
-      riskLevel: "low" | "medium" | "high";
-      decision: "allow" | "deny" | "info";
-      detail: string;
-      status?: string;
-    }> = [];
+    const items: ActivityLog[] = [];
 
-    const auditRows =
+    const auditRows: Audit[] =
       audit.length > 0 || !selected || !SHOW_DEMO_LOGS
         ? audit
         : [
@@ -281,19 +507,28 @@ export default function App() {
           ];
 
     for (const row of auditRows) {
+      const source: ActivitySource = ["read", "write", "act", "unknown"].includes(row.action)
+        ? "access"
+        : "lifecycle";
       items.push({
         id: row.id,
         timestamp: row.timestamp,
         agentId: row.agentId ?? selected?.id ?? null,
-        agentName: agents.find((agent) => agent.id === row.agentId)?.name ?? "Agent",
+        agentName: row.agentName ?? agents.find((agent) => agent.id === row.agentId)?.name ?? (row.agentId ? "Agent name unavailable" : "No Agent associated"),
+        agentPrincipalId: row.agentPrincipalId,
         runId: row.runId,
         userId: row.humanPrincipalId.replace(/^user:/, ""),
         summary: `${row.action} on ${row.resource}`,
         action: row.action,
-        capability: row.method ?? row.resource,
+        source,
         resource: row.resource,
         scope: row.scope,
-        riskLevel: row.operationRiskLevel ?? (row.decision === "deny" ? "high" : "low"),
+        method: row.method,
+        riskLevel: source === "access"
+          ? row.operationRiskLevel ?? (row.decision === "deny" ? "high" : "low")
+          : "observed",
+        riskScore: source === "access" ? row.operationRiskScore ?? null : null,
+        riskFactors: source === "access" ? row.operationRiskFactors ?? [] : [],
         decision: row.decision,
         detail: row.reason || row.resource,
       });
@@ -305,43 +540,54 @@ export default function App() {
         timestamp: node.createdAt,
         agentId: node.agentId ?? selected?.id ?? null,
         agentName: agents.find((agent) => agent.id === node.agentId)?.name ?? selected?.name ?? "Agent",
+        agentPrincipalId: null,
         runId: node.runId,
         userId: "—",
         summary: `${node.status} · ${node.type}`,
         action: node.type === "agent" ? "Agent node" : node.type === "task" ? "Task execution" : "Workflow orchestration",
-        capability: node.type,
+        source: "workflow",
         resource: node.type,
         scope: null,
-        riskLevel: node.riskLevel,
+        method: null,
+        riskLevel: "observed",
+        riskScore: null,
+        riskFactors: [],
         decision: "info",
         detail: `${node.status} · ${node.type}`,
         status: node.status,
       });
     }
 
-    for (const item of runProgress) {
+    for (const item of loggedRunProgress) {
       items.push({
         id: item.id,
         timestamp: item.timestamp,
         agentId: selected?.id ?? null,
         agentName: selected?.name ?? "Agent",
-        runId: activeRun?.id ?? null,
+        agentPrincipalId: null,
+        runId: item.runId,
         userId: "—",
         summary: item.summary || "Progress event",
         action: item.label,
-        capability: item.type,
+        source: item.type === "response_ready" ? "response" : "runtime",
         resource: item.type,
         scope: null,
-        riskLevel: item.type.includes("validation") ? "medium" : item.type.includes("command") ? "high" : "low",
+        method: null,
+        riskLevel: "observed",
+        riskScore: null,
+        riskFactors: [],
         decision: "info",
-        detail: item.summary || item.detail || "Progress event",
+        detail: item.type === "response_ready"
+          ? item.output ?? "Codex response is unavailable."
+          : item.detail ?? (item.summary || "Progress event"),
+        runStatus: item.runStatus,
       });
     }
 
     return items.sort(
       (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
     );
-  }, [activeRun, agents, audit, runProgress, selected, workflow]);
+  }, [agents, audit, loggedRunProgress, selected, workflow]);
 
   const selectedWorkflowNode = useMemo(
     () => workflow.find((node) => node.id === selectedWorkflowNodeId) ?? workflow[0] ?? null,
@@ -352,6 +598,91 @@ export default function App() {
     () => agentLogs.find((log) => log.id === selectedLogId) ?? agentLogs[0] ?? null,
     [agentLogs, selectedLogId],
   );
+
+  const activityRunGroups = useMemo((): ActivityRunGroup[] => {
+    const userMessages = messages
+      .filter((message) => message.role === "user")
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    const messageByRunId = new Map(userMessages.map((message, index) => [
+      message.runId,
+      { prompt: shortenPrompt(message.content), number: index + 1 },
+    ]));
+    const runById = new Map(runs.map((run) => [run.id, run]));
+    const groups = new Map<string, ActivityRunGroup>();
+
+    for (const log of agentLogs) {
+      const id = log.runId ?? "agent-setup";
+      const existing = groups.get(id);
+      if (existing) {
+        existing.logs.push(log);
+        if (log.timestamp > existing.latestTimestamp) existing.latestTimestamp = log.timestamp;
+        if (log.source === "access" && log.decision === "allow") existing.allowCount += 1;
+        if (log.source === "access" && log.decision === "deny") existing.denyCount += 1;
+        continue;
+      }
+      const message = log.runId ? messageByRunId.get(log.runId) : undefined;
+      const run = log.runId ? runById.get(log.runId) : undefined;
+      groups.set(id, {
+        id,
+        runId: log.runId,
+        label: message ? `Message ${message.number}` : log.runId ? "Run activity" : "Agent setup",
+        prompt: message?.prompt ?? null,
+        status: run?.status ?? null,
+        allowCount: log.source === "access" && log.decision === "allow" ? 1 : 0,
+        denyCount: log.source === "access" && log.decision === "deny" ? 1 : 0,
+        logs: [log],
+        latestTimestamp: log.timestamp,
+      });
+    }
+
+    return [...groups.values()]
+      .map((group) => ({
+        ...group,
+        logs: [...group.logs].sort((left, right) => new Date(right.timestamp).getTime() - new Date(left.timestamp).getTime()),
+      }))
+      .sort((left, right) => new Date(right.latestTimestamp).getTime() - new Date(left.latestTimestamp).getTime());
+  }, [agentLogs, messages, runs]);
+
+  const toggleRunGroup = (groupId: string) => {
+    setExpandedRunGroupIds((current) => {
+      const next = new Set(current);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
+      return next;
+    });
+  };
+
+  const copyActivityLog = async () => {
+    const text = [
+      "Agent Launchpad activity log",
+      selected ? `Agent: ${selected.name}` : "Agent: all activity",
+      ...activityRunGroups.map((group) => [
+        `=== ${group.label} ===`,
+        group.prompt ? `User request: ${group.prompt}` : null,
+        group.runId ? `Run: ${group.runId}` : null,
+        group.status ? `Run status: ${group.status}` : null,
+        ...group.logs.map((log) => [
+          `[${formatDateTime(log.timestamp)}] ${activityActionLabel(log)}`,
+          `Type: ${activitySourceLabel(log.source)}`,
+          `Agent: ${log.agentName}`,
+          log.source === "access" ? `Resource: ${log.resource}` : null,
+          log.source === "access" ? `Required scope: ${log.scope ?? "—"}` : null,
+          log.source === "access" || log.source === "lifecycle"
+            ? `Decision: ${log.decision}`
+            : `Status: ${log.source === "response" ? "completed" : log.status ?? "recorded"}`,
+          `Risk: ${formatRiskLabel(log.riskLevel)}`,
+          `Detail: ${log.detail}`,
+        ].filter((line): line is string => line !== null).join("\n")),
+      ].filter((line): line is string => line !== null).join("\n\n")),
+    ].join("\n\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      setLogCopied(true);
+      window.setTimeout(() => setLogCopied(false), 2_000);
+    } catch {
+      setError("Could not copy the activity log. Check browser clipboard permissions.");
+    }
+  };
 
   const refreshAgents = useCallback(async () => {
     const { agents: next } = await api.listAgents();
@@ -416,7 +747,9 @@ export default function App() {
     setShowSettings(false);
     setShowVaultForm(false);
     setAudit([]);
+    setRuns([]);
     setWorkflow([]);
+    setExpandedRunGroupIds(new Set());
     setSelectedForRevoke(new Set());
     if (!selectedId) {
       setMessages([]);
@@ -431,6 +764,7 @@ export default function App() {
       .then(async ([, runsResult, auditResult]) => {
         if (selectedIdRef.current !== selectedId) return;
         setAudit(auditResult.audit);
+        setRuns(runsResult.runs);
         const latest = runsResult.runs[0] ?? null;
         setActiveRun(latest);
         if (latest) {
@@ -800,6 +1134,12 @@ export default function App() {
         const workflowResult = await api.workflow(runId);
         if (selectedIdRef.current === agentId) {
           setActiveRun(result.run);
+          setRuns((current) => {
+            const existing = current.find((run) => run.id === result.run.id);
+            return existing
+              ? current.map((run) => run.id === result.run.id ? result.run : run)
+              : [result.run, ...current];
+          });
           setAudit(auditResult.audit);
           setWorkflow(workflowResult.workflow);
         }
@@ -824,6 +1164,7 @@ export default function App() {
       if (selectedIdRef.current === selected.id) {
         setMessages((current) => [...current, result.message]);
         setActiveRun(result.run);
+        setRuns((current) => [result.run, ...current.filter((run) => run.id !== result.run.id)]);
       }
       setAgents((current) =>
         current.map((agent) =>
@@ -1114,7 +1455,7 @@ export default function App() {
         </div>
       </aside>
 
-      <main className="main">
+      <main className={"main" + (selected && currentRole !== "admin" ? " main-agent-workspace" : "")}>
         {currentRole !== "admin" && (!system?.arkConfigured || !system?.codexAvailable) ? (
           <div className="config-banner">
             <span>!</span>
@@ -1285,12 +1626,12 @@ export default function App() {
                     onClick={() => setSelectedLogId(log.id)}
                   >
                     <div className="log-list-top">
-                      <span className={"risk-badge risk-" + log.riskLevel}>{log.riskLevel}</span>
+                      <span className={"risk-badge risk-" + log.riskLevel}>{formatRiskLabel(log.riskLevel)}</span>
                       <span className="log-list-time">{formatTime(log.timestamp)}</span>
                     </div>
-                    <strong>{log.action}</strong>
+                    <strong>{activityActionLabel(log)}</strong>
                     <span>{log.userId} · {log.agentName} · {log.resource}</span>
-                    <small>{log.detail}</small>
+                    <small>{log.source === "response" ? log.summary : log.detail}</small>
                   </button>
                 ))}
               {agentLogs.filter((log) => auditFilter === "all" || log.decision === auditFilter).length === 0 && (
@@ -1322,13 +1663,6 @@ export default function App() {
                   disabled={busy}
                 >
                   {selected.status === "stopped" ? "Start" : "Stop"}
-                </button>
-                <button
-                  className="button button-ghost"
-                  onClick={revokeCredential}
-                  disabled={busy || selected.status === "busy"}
-                >
-                  Revoke
                 </button>
                 <button
                   className="button button-danger"
@@ -1530,29 +1864,64 @@ export default function App() {
                         <span className="eyebrow">Agent log stream</span>
                         <h3>{selected.name}</h3>
                       </div>
-                      <span className="logs-count">{agentLogs.length} events</span>
+                      <div className="logs-header-actions">
+                        <span className="logs-count">{agentLogs.length} events</span>
+                        <button type="button" className="button button-ghost" onClick={() => void copyActivityLog()}>
+                          {logCopied ? "Copied" : "Copy log"}
+                        </button>
+                      </div>
                     </div>
                     <div className="logs-layout">
                       <div className="logs-list-pane">
-                        {agentLogs.length === 0 ? (
+                        {activityRunGroups.length === 0 ? (
                           <div className="empty-log-state">No logs yet — start a run to populate the activity stream.</div>
                         ) : (
-                          agentLogs.map((log) => (
-                            <button
-                              key={log.id}
-                              type="button"
-                              className={"log-list-item risk-row-" + log.riskLevel + (selectedLog?.id === log.id ? " log-list-item-selected" : "")}
-                              onClick={() => setSelectedLogId(log.id)}
-                            >
-                              <div className="log-list-top">
-                                <span className={"risk-badge risk-" + log.riskLevel}>{log.riskLevel}</span>
-                                <span className="log-list-time">{formatTime(log.timestamp)}</span>
-                              </div>
-                              <strong>{log.action}</strong>
-                              <span>{log.capability}</span>
-                              <small>{log.userId} · {log.resource} · {log.detail}</small>
-                            </button>
-                          ))
+                          activityRunGroups.map((group) => {
+                            const isCollapsed = !expandedRunGroupIds.has(group.id);
+                            return (
+                              <section key={group.id} className="run-log-group">
+                                <button
+                                  type="button"
+                                  className={"run-log-group-header" + (group.denyCount > 0 ? " run-log-group-deny" : group.allowCount > 0 ? " run-log-group-allow" : "")}
+                                  onClick={() => toggleRunGroup(group.id)}
+                                  aria-expanded={!isCollapsed}
+                                >
+                                  <div>
+                                    <span className="eyebrow">{group.label}</span>
+                                    <strong>{group.prompt ?? "Agent configuration and lifecycle activity"}</strong>
+                                    {group.status && <small>{group.status}</small>}
+                                    <span className="run-log-group-outcome">{groupOutcomeSummary(group)}</span>
+                                  </div>
+                                  <div className="run-log-group-meta">
+                                    <span>{group.logs.length} events</span>
+                                    {(group.allowCount > 0 || group.denyCount > 0) && <span>{group.allowCount} allow · {group.denyCount} deny</span>}
+                                    <span>{isCollapsed ? "Expand" : "Collapse"}</span>
+                                  </div>
+                                </button>
+                                {!isCollapsed && (
+                                  <div className="run-log-group-events">
+                                    <span className="run-log-group-events-label">Technical activity</span>
+                                    {group.logs.map((log) => (
+                                      <button
+                                        key={log.id}
+                                        type="button"
+                                        className={"log-list-item risk-row-" + log.riskLevel + (selectedLog?.id === log.id ? " log-list-item-selected" : "")}
+                                        onClick={() => setSelectedLogId(log.id)}
+                                      >
+                                        <div className="log-list-top">
+                                          <span className={"risk-badge risk-" + log.riskLevel}>{formatRiskLabel(log.riskLevel)}</span>
+                                          <span className="log-list-time">{formatTime(log.timestamp)}</span>
+                                        </div>
+                                        <strong>{activityActionLabel(log)}</strong>
+                                        <span>{log.source === "access" ? log.scope ?? "No required scope" : activitySourceLabel(log.source)}</span>
+                                        <small>{activityPreview(log)}</small>
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
+                              </section>
+                            );
+                          })
                         )}
                       </div>
 
@@ -1562,35 +1931,81 @@ export default function App() {
                             <div className="log-detail-header">
                               <div>
                                 <span className="eyebrow">Activity Detail</span>
-                                <h4>{selectedLog.action}</h4>
+                                <h4>{activityActionLabel(selectedLog)}</h4>
                               </div>
-                              <span className={"risk-badge risk-" + selectedLog.riskLevel}>{selectedLog.riskLevel}</span>
+                              <span className={"risk-badge risk-" + selectedLog.riskLevel}>{formatRiskLabel(selectedLog.riskLevel)}</span>
                             </div>
 
                             <div className="log-detail-card">
-                              <div className="log-detail-block">
-                                <label>Summary</label>
-                                <p>{selectedLog.summary}</p>
+                              <div className={"activity-outcome " + activityOutcomeClass(selectedLog)}>
+                                <span>Outcome</span>
+                                <strong>{activityOutcomeLabel(selectedLog)}</strong>
+                                <p>{activitySummary(selectedLog)}</p>
+                                {(selectedLog.source === "access" || selectedLog.source === "lifecycle") && (
+                                  <p className="activity-outcome-reason"><b>{selectedLog.decision === "allow" ? "Why allowed:" : "Why blocked:"}</b> {authorizationReason(selectedLog)}</p>
+                                )}
+                                {selectedLog.source === "access" && (selectedLog.riskScore !== null || selectedLog.riskFactors.length > 0) && (
+                                  <p className="activity-outcome-risk"><b>Risk:</b> {selectedLog.riskScore !== null ? `${formatRiskLabel(selectedLog.riskLevel)} · ${selectedLog.riskScore}/100` : formatRiskLabel(selectedLog.riskLevel)}{selectedLog.riskFactors.length > 0 ? ` · ${selectedLog.riskFactors.join(", ")}` : ""}</p>
+                                )}
+                                <small>{activitySourceLabel(selectedLog.source)}</small>
                               </div>
+                              <span className="technical-evidence-heading">Technical evidence</span>
                               <div className="log-detail-grid">
-                                <div><label>User</label><strong>{selectedLog.userId}</strong></div>
-                                <div><label>Agent</label><strong>{selectedLog.agentName}</strong></div>
-                                <div><label>Resource</label><strong>{selectedLog.resource}</strong></div>
-                                <div><label>Scope</label><strong>{selectedLog.scope ?? "—"}</strong></div>
+                                {selectedLog.source === "access" && (
+                                  <>
+                                    <div><label>Delegated by</label><strong>{selectedLog.userId}</strong></div>
+                                    <div><label>Agent identity</label><strong>{selectedLog.agentPrincipalId ?? "—"}</strong></div>
+                                  </>
+                                )}
+                                {selectedLog.source === "lifecycle" && <div><label>Started by</label><strong>{selectedLog.userId}</strong></div>}
+                                <div><label>{selectedLog.source === "lifecycle" ? "Target Agent" : "Agent"}</label><strong>{selectedLog.agentName}</strong></div>
+                                {selectedLog.source === "access" && (
+                                  <>
+                                    <div><label>Target resource</label><strong>{selectedLog.resource}</strong></div>
+                                    <div><label>Required permission</label><strong>{permissionDescription(selectedLog)}</strong></div>
+                                    <div><label>Technical permission</label><strong>{selectedLog.scope ?? "—"}</strong></div>
+                                    <div><label>HTTP method</label><strong>{selectedLog.method ?? "—"}</strong></div>
+                                  </>
+                                )}
+                                {selectedLog.runId && <div><label>Run</label><strong>{selectedLog.runId}</strong></div>}
                                 <div><label>Time</label><strong>{formatDateTime(selectedLog.timestamp)}</strong></div>
-                                <div><label>Result</label><strong>{selectedLog.decision}</strong></div>
-                                <div><label>Capability</label><strong>{selectedLog.capability}</strong></div>
+                                {(selectedLog.source === "access" || selectedLog.source === "lifecycle") ? (
+                                  <div><label>{selectedLog.source === "lifecycle" ? "Ownership check" : "Access decision"}</label><strong>{decisionOutcomeLabel(selectedLog)}</strong></div>
+                                ) : (
+                                  <div><label>Status</label><strong>{activityStatusLabel(selectedLog)}</strong></div>
+                                )}
                               </div>
 
-                              <div className="log-detail-block">
-                                <label>Details</label>
-                                <p>{selectedLog.detail}</p>
-                              </div>
+                              {selectedLog.source === "runtime" && selectedLog.resource === "error" && (
+                                <div className="log-detail-block">
+                                  <label>What this means</label>
+                                  <p>{runtimeWarningExplanation(selectedLog)}</p>
+                                </div>
+                              )}
+                              {(selectedLog.source === "workflow" || (selectedLog.source === "runtime" && selectedLog.resource !== "error")) && selectedLog.detail !== selectedLog.summary && (
+                                <div className="log-detail-block">
+                                  {commandFromDetail(selectedLog.detail) ? (
+                                    <>
+                                      <label>Command</label>
+                                      <pre className="log-command"><code>{commandFromDetail(selectedLog.detail)}</code></pre>
+                                      {outputFromCommandDetail(selectedLog.detail) && <><label>Output</label><p>{outputFromCommandDetail(selectedLog.detail)}</p></>}
+                                    </>
+                                  ) : (
+                                    <><label>Event detail</label><p>{selectedLog.detail}</p></>
+                                  )}
+                                </div>
+                              )}
+                              {selectedLog.source === "response" && (
+                                <div className="log-detail-block">
+                                  <label>Codex response</label>
+                                  <pre className="log-response">{selectedLog.detail}</pre>
+                                </div>
+                              )}
 
                               <div className="log-footer">
                                 {selectedLog.runId && <span>Run {selectedLog.runId.slice(0, 8)}</span>}
                                 {selectedLog.agentId && <span>Agent {selectedLog.agentId.slice(0, 8)}</span>}
-                                <span>{selectedLog.decision === "info" ? selectedLog.status?.toUpperCase() ?? "INFO" : selectedLog.decision.toUpperCase()}</span>
+                                <span>{activityOutcomeLabel(selectedLog)}</span>
                               </div>
                             </div>
                           </>
@@ -1678,7 +2093,12 @@ export default function App() {
                 <span className="eyebrow">Log stream</span>
                 <h3>{currentRole === "admin" ? "All agent activity" : selected?.name ?? "Agent activity"}</h3>
               </div>
-              <span className="logs-count">{agentLogs.length} events</span>
+              <div className="logs-header-actions">
+                <span className="logs-count">{agentLogs.length} events</span>
+                <button type="button" className="button button-ghost" onClick={() => void copyActivityLog()}>
+                  {logCopied ? "Copied" : "Copy log"}
+                </button>
+              </div>
             </div>
             <div className="audit-filter-row">
               {(["all", "allow", "deny"] as const).map((filter) => (
@@ -1703,9 +2123,9 @@ export default function App() {
                     onClick={() => setSelectedLogId(log.id)}
                   >
                     <span className="focused-log-status">{log.decision}</span>
-                    <strong>{log.action}</strong>
+                    <strong>{activityActionLabel(log)}</strong>
                     <span>{log.userId} · {log.agentName} · {log.resource}</span>
-                    <small>{log.detail}</small>
+                    <small>{activityPreview(log)}</small>
                     <time>{formatTime(log.timestamp)}</time>
                   </button>
                 ))}
@@ -1718,27 +2138,73 @@ export default function App() {
                 <div className="log-detail-header">
                   <div>
                     <span className="eyebrow">Activity Detail</span>
-                    <h4>{selectedLog.action}</h4>
+                    <h4>{activityActionLabel(selectedLog)}</h4>
                   </div>
-                  <span className={"risk-badge risk-" + selectedLog.riskLevel}>{selectedLog.riskLevel}</span>
+                  <span className={"risk-badge risk-" + selectedLog.riskLevel}>{formatRiskLabel(selectedLog.riskLevel)}</span>
                 </div>
-                <div className="log-detail-block">
-                  <label>Summary</label>
-                  <p>{selectedLog.summary}</p>
+                <div className={"activity-outcome " + activityOutcomeClass(selectedLog)}>
+                  <span>Outcome</span>
+                  <strong>{activityOutcomeLabel(selectedLog)}</strong>
+                  <p>{activitySummary(selectedLog)}</p>
+                  {(selectedLog.source === "access" || selectedLog.source === "lifecycle") && (
+                    <p className="activity-outcome-reason"><b>{selectedLog.decision === "allow" ? "Why allowed:" : "Why blocked:"}</b> {authorizationReason(selectedLog)}</p>
+                  )}
+                  {selectedLog.source === "access" && (selectedLog.riskScore !== null || selectedLog.riskFactors.length > 0) && (
+                    <p className="activity-outcome-risk"><b>Risk:</b> {selectedLog.riskScore !== null ? `${formatRiskLabel(selectedLog.riskLevel)} · ${selectedLog.riskScore}/100` : formatRiskLabel(selectedLog.riskLevel)}{selectedLog.riskFactors.length > 0 ? ` · ${selectedLog.riskFactors.join(", ")}` : ""}</p>
+                  )}
+                  <small>{activitySourceLabel(selectedLog.source)}</small>
                 </div>
+                <span className="technical-evidence-heading">Technical evidence</span>
                 <div className="log-detail-grid">
-                  <div><label>User</label><strong>{selectedLog.userId}</strong></div>
-                  <div><label>Agent</label><strong>{selectedLog.agentName}</strong></div>
-                  <div><label>Resource</label><strong>{selectedLog.resource}</strong></div>
-                  <div><label>Scope</label><strong>{selectedLog.scope ?? "—"}</strong></div>
+                  {selectedLog.source === "access" && (
+                    <>
+                      <div><label>Delegated by</label><strong>{selectedLog.userId}</strong></div>
+                      <div><label>Agent identity</label><strong>{selectedLog.agentPrincipalId ?? "—"}</strong></div>
+                    </>
+                  )}
+                  {selectedLog.source === "lifecycle" && <div><label>Started by</label><strong>{selectedLog.userId}</strong></div>}
+                  <div><label>{selectedLog.source === "lifecycle" ? "Target Agent" : "Agent"}</label><strong>{selectedLog.agentName}</strong></div>
+                  {selectedLog.source === "access" && (
+                    <>
+                      <div><label>Target resource</label><strong>{selectedLog.resource}</strong></div>
+                      <div><label>Required permission</label><strong>{permissionDescription(selectedLog)}</strong></div>
+                      <div><label>Technical permission</label><strong>{selectedLog.scope ?? "—"}</strong></div>
+                      <div><label>HTTP method</label><strong>{selectedLog.method ?? "—"}</strong></div>
+                    </>
+                  )}
+                  {selectedLog.runId && <div><label>Run</label><strong>{selectedLog.runId}</strong></div>}
                   <div><label>Time</label><strong>{formatDateTime(selectedLog.timestamp)}</strong></div>
-                  <div><label>Result</label><strong>{selectedLog.decision}</strong></div>
-                  <div><label>Capability</label><strong>{selectedLog.capability}</strong></div>
+                  {(selectedLog.source === "access" || selectedLog.source === "lifecycle") ? (
+                    <div><label>{selectedLog.source === "lifecycle" ? "Ownership check" : "Access decision"}</label><strong>{decisionOutcomeLabel(selectedLog)}</strong></div>
+                  ) : (
+                    <div><label>Status</label><strong>{activityStatusLabel(selectedLog)}</strong></div>
+                  )}
                 </div>
-                <div className="log-detail-block">
-                  <label>Details</label>
-                  <p>{selectedLog.detail}</p>
-                </div>
+                {selectedLog.source === "runtime" && selectedLog.resource === "error" && (
+                  <div className="log-detail-block">
+                    <label>What this means</label>
+                    <p>{runtimeWarningExplanation(selectedLog)}</p>
+                  </div>
+                )}
+                {(selectedLog.source === "workflow" || (selectedLog.source === "runtime" && selectedLog.resource !== "error")) && selectedLog.detail !== selectedLog.summary && (
+                  <div className="log-detail-block">
+                    {commandFromDetail(selectedLog.detail) ? (
+                      <>
+                        <label>Command</label>
+                        <pre className="log-command"><code>{commandFromDetail(selectedLog.detail)}</code></pre>
+                        {outputFromCommandDetail(selectedLog.detail) && <><label>Output</label><p>{outputFromCommandDetail(selectedLog.detail)}</p></>}
+                      </>
+                    ) : (
+                      <><label>Event detail</label><p>{selectedLog.detail}</p></>
+                    )}
+                  </div>
+                )}
+                {selectedLog.source === "response" && (
+                  <div className="log-detail-block">
+                    <label>Codex response</label>
+                    <pre className="log-response">{selectedLog.detail}</pre>
+                  </div>
+                )}
               </div>
             )}
           </div>

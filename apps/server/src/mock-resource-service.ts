@@ -100,6 +100,14 @@ export class MockResourceService {
           })),
         );
       }
+      // Older stores kept resource values as plaintext. Encrypt these records
+      // during startup so legacy data can still be served through the current
+      // redacting relay instead of failing when `decrypt` expects v1 ciphertext.
+      for (const resource of db.mockResources) {
+        if (!resource.value.startsWith("v1:")) {
+          resource.value = encrypt(resource.value, this.config.secretsKey);
+        }
+      }
       if (db.deployStates.length === 0) {
         db.deployStates.push(...SEED_DEPLOYS.map((state) => ({ ...state })));
       }
@@ -414,7 +422,7 @@ export class MockResourceService {
         path,
         credential,
         "capability not granted",
-        requestedCapability.scope,
+        scope.scope,
       )
 
       return {
@@ -439,6 +447,7 @@ export class MockResourceService {
       humanPrincipalId: "user:" + credential.ownerId,
       agentId: credential.agentId,
       agentPrincipalId: "agent:" + credential.agentId,
+      agentName: agent?.name ?? null,
       planId: null,
       planHash: null,
       capability: `${requestedCapability.action}:${requestedCapability.resource}:${requestedCapability.scope}`,
@@ -460,7 +469,7 @@ export class MockResourceService {
         agent,
         agentProfile,
         scope.resource,
-        method,
+        scope.scope,
         recentAudit,
       );
 
@@ -586,10 +595,15 @@ export class MockResourceService {
     scope: string | null,
   ): Promise<void> {
     const derived = this.deriveScope(method, path);
-    await this.writeAudit({
+    const database = this.store.snapshot();
+    const agent = credential
+      ? database.agents.find((entry) => entry.id === credential.agentId)
+      : undefined;
+    const auditEntry: Omit<Audit, "id" | "timestamp"> = {
       humanPrincipalId: credential ? "user:" + credential.ownerId : "unknown",
       agentId: credential?.agentId ?? null,
       agentPrincipalId: credential ? "agent:" + credential.agentId : null,
+      agentName: agent?.name ?? null,
       planId: null,
       planHash: null,
       capability: derived
@@ -602,7 +616,23 @@ export class MockResourceService {
       scope: scope ?? derived?.scope ?? null,
       decision: "deny",
       reason,
-    });
+    };
+    if (agent && derived) {
+      const recentAudit = database.audit
+        .filter((entry) => entry.agentId === credential?.agentId)
+        .slice(-20);
+      const assessment = assessOperationRisk(
+        agent,
+        calculateAgentRiskProfile(agent, recentAudit),
+        derived.resource,
+        derived.scope,
+        recentAudit,
+      );
+      auditEntry.operationRiskLevel = assessment.operationRiskLevel;
+      auditEntry.operationRiskScore = assessment.operationRiskScore;
+      auditEntry.operationRiskFactors = assessment.operationRiskFactors;
+    }
+    await this.writeAudit(auditEntry);
   }
 
   /* Normalizes the current AgentCredential representation into the
@@ -734,9 +764,17 @@ export class MockResourceService {
   }
 
   listAudit(agentId?: string): Audit[] {
-    const all = this.store.snapshot().audit;
+    const database = this.store.snapshot();
+    const all = database.audit;
     const filtered = agentId ? all.filter((entry) => entry.agentId === agentId) : all;
-    return [...filtered].sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+    return filtered
+      .map((entry) => ({
+        ...entry,
+        agentName: entry.agentName ?? (entry.agentId
+          ? database.agents.find((agent) => agent.id === entry.agentId)?.name ?? null
+          : null),
+      }))
+      .sort((left, right) => right.timestamp.localeCompare(left.timestamp));
   }
 
 }

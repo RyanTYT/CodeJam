@@ -50,6 +50,7 @@ export interface Audit {
   humanPrincipalId: string;
   agentId: string | null;
   agentPrincipalId: string | null;
+  agentName?: string | null;
   runId: string | null;
   method: string | null;
   action: string;

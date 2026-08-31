@@ -178,6 +178,8 @@ export interface Audit {
   humanPrincipalId: string;
   agentId: string | null;
   agentPrincipalId: string | null;
+  /** Agent display name at the time of the audited event. */
+  agentName?: string | null;
   runId: string | null;
   planId?: string | null;
   planHash?: string | null;

@@ -134,26 +134,24 @@ export class IntentPlanner {
     const lower = intent.toLowerCase();
     const scopes = new Set<string>();
     const wantsRead = /\b(read|fetch|get|db|database|secret|url|connection|retrieve)/.test(lower);
-    const wantsWrite = /\b(write|update|create|migrate|insert|seed|modify)/.test(lower);
+    const wantsWrite = /\b(write|update|delete|rotate|replace|change|migrate|insert|seed|modify)/.test(lower);
     for (const key of secretKeys) {
       const klower = key.toLowerCase();
-      const parts = klower.split(/[^a-z0-9]+/).filter((part) => part.length >= 2);
-      const mentioned = lower.includes(klower) || parts.some((part) => lower.includes(part));
+      const parts = klower
+        .split(/[^a-z0-9]+/)
+        .filter((part) => part.length >= 3 && !["api", "db", "key", "token", "url"].includes(part));
+      const mentioned = lower.includes(klower) || parts.some((part) => new RegExp(`\\b${part}\\b`).test(lower));
       if (mentioned && wantsRead) scopes.add(`read:secrets:${key}`);
       if (mentioned && wantsWrite) scopes.add(`write:secrets:${key}`);
     }
-    // No specific secret matched but the intent is about reading → grant the first one.
-    const firstKey = secretKeys[0];
-    if (scopes.size === 0 && firstKey && wantsRead) {
-      scopes.add(`read:secrets:${firstKey}`);
-    }
-    // Benign intent with no keyword match → still default to reading the first secret
-    // so a fresh agent has a baseline scope to exercise the relay with.
-    if (scopes.size === 0 && firstKey) {
-      scopes.add(`read:secrets:${firstKey}`);
-    }
-    if (/\b(deploy|ship|release)/.test(lower)) {
-      scopes.add(/\b(prod|production)/.test(lower) ? "act:deploy:prod" : "act:deploy:dev");
+    // Never grant an arbitrary secret just to make a plan non-empty. The user
+    // must name a resource, or explicitly select one in the permissions plan.
+    const declinesDeploy = /\b(?:do not|don't|never|without|no)\s+(?:\w+\s+){0,3}(?:deploy(?:ing|ed|s)?|ship(?:ping|ped|s)?|release(?:d|s)?)\b/.test(lower);
+    const declinesProd = /\b(?:do not|don't|never|without|no)\s+(?:\w+\s+){0,5}(?:prod|production)\b/.test(lower);
+    const requestsDeploy = /\b(deploy(?:ing|ed|s)?|ship(?:ping|ped|s)?|release(?:d|s)?)\b/.test(lower) && !declinesDeploy;
+    const requestsProd = /\b(prod|production)\b/.test(lower) && !declinesProd;
+    if (requestsDeploy) {
+      scopes.add(requestsProd ? "act:deploy:prod" : "act:deploy:dev");
     }
     return {
       scopes: [...scopes],

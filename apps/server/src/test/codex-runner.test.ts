@@ -92,4 +92,40 @@ describe("Codex runner protocol", () => {
       ]),
     );
   });
+
+  it("formats command activity without repeating the command and redacts token values", () => {
+    const parsed = {
+      messages: [] as string[],
+      threadId: null as string | null,
+      usage: null as {
+        inputTokens?: number;
+        cachedInputTokens?: number;
+        outputTokens?: number;
+      } | null,
+      errors: [] as string[],
+      events: [] as Array<{ type: string; label: string; summary: string; detail?: string }>,
+    };
+    parseCodexEventLine(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "command_execution",
+          command: "curl --token=secret-value https://example.test",
+          output: "ok",
+        },
+      }),
+      parsed,
+    );
+
+    expect(parsed.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "command_execution",
+          label: "Command",
+          summary: "Ran command",
+          detail: "Command: curl --token=[redacted] https://example.test\nOutput: ok",
+        }),
+      ]),
+    );
+  });
 });

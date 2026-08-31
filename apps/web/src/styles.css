@@ -85,7 +85,8 @@ button {
 }
 
 .app-shell {
-  min-height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
   display: grid;
   grid-template-columns: 276px minmax(0, 1fr) 360px;
 }
@@ -132,7 +133,8 @@ button {
 }
 
 .sidebar {
-  min-height: 100vh;
+  min-height: 0;
+  overflow-y: auto;
   padding: 24px 18px;
   background: #242421;
   color: #f5f3ed;
@@ -391,15 +393,40 @@ button {
 
 .main {
   min-width: 0;
-  min-height: 100vh;
+  min-height: 0;
+  overflow-y: auto;
   padding: 22px 34px 34px;
   background:
     radial-gradient(circle at 86% -10%, rgba(105, 84, 217, 0.09), transparent 30%),
     #f2f1ed;
 }
 
+.main-agent-workspace {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.main-agent-workspace > .playground {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  height: auto;
+}
+
+.main-agent-workspace > .agent-header {
+  width: 100%;
+  max-width: none;
+  margin: 0 0 18px;
+}
+
+.main-agent-workspace > .user-log-container {
+  min-height: 0;
+  height: auto;
+}
+
 .policy-console {
-  min-height: 100vh;
+  min-height: 0;
   min-width: 0;
   overflow-y: auto;
   padding: 18px 18px 24px;
@@ -875,6 +902,11 @@ textarea:focus {
   border-left-color: #c45b58;
 }
 
+.risk-row-observed {
+  background: #f5f3ef;
+  border-left-color: #aaa69f;
+}
+
 .focused-log:hover,
 .focused-log-selected {
   border-top-color: currentColor;
@@ -894,7 +926,7 @@ textarea:focus {
 
 .focused-log-detail .log-detail-grid {
   grid-template-columns: 1fr;
-  gap: 10px;
+  gap: 0;
 }
 
 .logs-header-row {
@@ -917,6 +949,12 @@ textarea:focus {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.1em;
+}
+
+.logs-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .logs-layout {
@@ -944,6 +982,98 @@ textarea:focus {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.run-log-group {
+  overflow: hidden;
+  border: 1px solid #e4e0d7;
+  border-radius: 12px;
+  background: #fbfaf8;
+}
+
+.run-log-group-header {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border: 0;
+  border-bottom: 1px solid #e9e5dd;
+  background: #f5f3ef;
+  color: #2f2f2b;
+  text-align: left;
+  cursor: pointer;
+}
+
+.run-log-group-header:hover {
+  background: #efedf8;
+}
+
+.run-log-group-header.run-log-group-allow {
+  background: linear-gradient(135deg, #f5f3ef 0%, #eef8f1 48%, #b7e5c7 100%);
+}
+
+.run-log-group-header.run-log-group-deny {
+  background: linear-gradient(135deg, #f5f3ef 0%, #fcf0ef 48%, #edbebc 100%);
+}
+
+.run-log-group-header.run-log-group-allow:hover {
+  background: linear-gradient(135deg, #f0f7f2 0%, #e1f4e8 38%, #a8dcc0 100%);
+}
+
+.run-log-group-header.run-log-group-deny:hover {
+  background: linear-gradient(135deg, #faf1f0 0%, #f8e3e1 38%, #e9afac 100%);
+}
+
+.run-log-group-header > div:first-child {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.run-log-group-header strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.run-log-group-outcome {
+  color: #4c4b46;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.run-log-group-header small,
+.run-log-group-meta {
+  color: #696962;
+  font-size: 10px;
+}
+
+.run-log-group-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex: 0 0 auto;
+  text-align: right;
+}
+
+.run-log-group-events {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+}
+
+.run-log-group-events-label {
+  padding: 3px 4px 0;
+  color: #7a7870;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .log-list-item {
@@ -983,6 +1113,11 @@ textarea:focus {
 .log-list-item.risk-row-high {
   background: #fbe8e7;
   border-left: 4px solid #c45b58;
+}
+
+.log-list-item.risk-row-observed {
+  background: #f5f3ef;
+  border-left: 4px solid #aaa69f;
 }
 
 .log-list-top {
@@ -1046,10 +1181,91 @@ textarea:focus {
   border: 1px solid #e7e2d9;
 }
 
+.activity-outcome {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid transparent;
+  border-left-width: 4px;
+  border-radius: 10px;
+}
+
+.activity-outcome > span,
+.technical-evidence-heading {
+  color: #696962;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.activity-outcome strong {
+  font-size: 16px;
+  letter-spacing: -0.02em;
+}
+
+.activity-outcome p {
+  margin: 0;
+  color: #3d3d38;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.activity-outcome-reason,
+.activity-outcome-risk {
+  padding-top: 5px;
+  border-top: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+}
+
+.activity-outcome-reason b,
+.activity-outcome-risk b {
+  font-weight: 700;
+}
+
+.activity-outcome small {
+  color: #696962;
+  font-size: 10px;
+}
+
+.outcome-allowed,
+.outcome-completed {
+  border-color: #b9dcc8;
+  border-left-color: #3d9b70;
+  background: transparent;
+}
+
+.outcome-blocked {
+  border-color: #efc7c5;
+  border-left-color: #c45b58;
+  background: transparent;
+}
+
+.outcome-warning {
+  border-color: #efd9a8;
+  border-left-color: #d7952b;
+  background: transparent;
+}
+
+.outcome-recovered,
+.outcome-observed {
+  border-color: #dedad2;
+  border-left-color: #aaa69f;
+  background: transparent;
+}
+
+.technical-evidence-heading {
+  padding-top: 2px;
+}
+
 .log-detail-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid #e5e1d9;
+  border-radius: 10px;
+  background: transparent;
 }
 
 .log-detail-grid div,
@@ -1057,6 +1273,23 @@ textarea:focus {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.log-detail-grid div {
+  padding: 9px 10px;
+  border-bottom: 1px solid #ece8e0;
+}
+
+.log-detail-grid div:last-child {
+  border-bottom: 0;
+}
+
+.log-detail-card > .log-detail-block,
+.focused-log-detail > .log-detail-block {
+  padding: 10px;
+  border: 1px solid #e5e1d9;
+  border-radius: 10px;
+  background: transparent;
 }
 
 .log-detail-grid label,
@@ -1115,6 +1348,27 @@ textarea:focus {
 .risk-high {
   background: rgba(234, 88, 88, 0.12);
   color: #a63d3d;
+}
+
+.risk-observed {
+  background: rgba(112, 112, 106, 0.12);
+  color: #66645e;
+}
+
+.log-command,
+.log-response {
+  margin: 6px 0 0;
+  padding: 10px;
+  overflow-x: auto;
+  border: 1px solid #e1ddd5;
+  border-radius: 8px;
+  background: #f5f3ef;
+  color: #35342f;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .empty-log-state {
@@ -1513,6 +1767,8 @@ textarea:focus {
 @media (max-width: 680px) {
   .app-shell {
     display: block;
+    height: auto;
+    overflow: visible;
   }
 
   .sidebar {
@@ -1552,6 +1808,7 @@ textarea:focus {
   .main {
     padding: 12px;
     min-height: calc(100vh - 65px);
+    overflow-y: visible;
   }
 
   .agent-header {
