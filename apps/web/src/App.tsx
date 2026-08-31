@@ -118,6 +118,7 @@ export default function App() {
     redactedView: "",
   });
   const [showVaultForm, setShowVaultForm] = useState(false);
+  const [editingSecretKey, setEditingSecretKey] = useState<string | null>(null);
   const [users, setUsers] = useState<User[]>([]);
   const [showAddUser, setShowAddUser] = useState(false);
   const [newUserForm, setNewUserForm] = useState<{ userId: string; role: "user" | "admin" }>({
@@ -135,6 +136,9 @@ export default function App() {
   selectedIdRef.current = selectedId;
   const currentRole: "admin" | "user" =
     users.find((u) => u.userId === currentUser)?.role ?? "user";
+
+  const myScopes: string[] =
+    users.find((u) => u.userId === currentUser)?.scopes ?? [];
 
   const selected = useMemo(
     () => agents.find((agent) => agent.id === selectedId) ?? null,
@@ -463,7 +467,6 @@ export default function App() {
 
   const addSecret = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!selected) return;
     if (currentRole !== "admin") {
       setError("Only admins may manage secrets.");
       return;
@@ -476,12 +479,24 @@ export default function App() {
       await api.addSecret(key.trim(), value, redactedView.trim() || undefined);
       await refreshSecrets();
       setVaultForm({ key: "", value: "", redactedView: "" });
+      setEditingSecretKey(null);
       setShowVaultForm(false);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setBusy(false);
     }
+  };
+
+  const editSecret = (key: string) => {
+    setEditingSecretKey(key);
+    setVaultForm({ key, value: "", redactedView: "" });
+    setShowVaultForm(false);
+  };
+
+  const cancelEditSecret = () => {
+    setEditingSecretKey(null);
+    setVaultForm({ key: "", value: "", redactedView: "" });
   };
 
   const revokeSecret = async (key: string) => {
@@ -717,7 +732,7 @@ export default function App() {
   const switcherUsers = users.length > 0 ? users.map((u) => u.userId) : ["default"];
 
   return (
-    <div className="app-shell">
+    <div className={"app-shell" + (currentRole === "admin" ? " app-shell-wide" : "")}>
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">A</div>
@@ -753,7 +768,7 @@ export default function App() {
               </button>
             ))}
           </div>
-          {currentRole === "admin" && (
+          {currentRole === "admin" ? (
             <div style={{ display: "flex", gap: 6 }}>
               <button
                 style={{
@@ -800,12 +815,37 @@ export default function App() {
                   setShowAdmin(true);
                 }}
               >
-                <span>⚙</span> Admin
+                <span>⚙</span> Permissions
               </button>
             </div>
+          ) : (
+            <button
+              style={{
+                width: "100%",
+                minHeight: 32,
+                fontSize: 11,
+                border: "1px solid #3d3d38",
+                background: "#292925",
+                color: "#c9c8c1",
+                borderRadius: 9,
+                cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 6,
+              }}
+              onClick={() => {
+                void refreshUsers();
+                setShowAdmin(true);
+              }}
+            >
+              <span>⚙</span> My permissions
+            </button>
           )}
         </div>
 
+        {currentRole !== "admin" && (
+          <>
         <button
           className="button button-primary create-button"
           onClick={() => {
@@ -845,6 +885,8 @@ export default function App() {
             </div>
           )}
         </nav>
+          </>
+        )}
 
         <div className="runtime-card">
           <span className="eyebrow">Runtime</span>
@@ -857,7 +899,7 @@ export default function App() {
       </aside>
 
       <main className="main">
-        {!system?.arkConfigured || !system?.codexAvailable ? (
+        {currentRole !== "admin" && (!system?.arkConfigured || !system?.codexAvailable) ? (
           <div className="config-banner">
             <span>!</span>
             <div>
@@ -880,7 +922,103 @@ export default function App() {
           </div>
         )}
 
-        {selected ? (
+        {currentRole === "admin" ? (
+          <section className="secrets-panel">
+            <div className="secrets-head">
+              <div>
+                <span className="eyebrow">Secrets management</span>
+                <h1>Centralized secrets</h1>
+              </div>
+              <span className="eyebrow">{secrets.length}</span>
+            </div>
+            <p className="owner-note" style={{ margin: "0 0 14px" }}>
+              Add, update, or delete the centralized secrets that users and agents access.
+              Values are encrypted at rest; only the redacted label is ever returned.
+            </p>
+            <form className="vault-form" onSubmit={addSecret}>
+              <div className="secrets-form-row">
+                <label>
+                  Key
+                  <input
+                    value={vaultForm.key}
+                    onChange={(event) => setVaultForm({ ...vaultForm, key: event.target.value })}
+                    readOnly={!!editingSecretKey}
+                    required
+                    maxLength={120}
+                    placeholder="dev-db-url"
+                  />
+                </label>
+                <label>
+                  Redacted label (optional)
+                  <input
+                    value={vaultForm.redactedView}
+                    onChange={(event) =>
+                      setVaultForm({ ...vaultForm, redactedView: event.target.value })
+                    }
+                    maxLength={200}
+                    placeholder="postgres://***:***@db/agentdb"
+                  />
+                </label>
+              </div>
+              <label>
+                Value
+                <textarea
+                  value={vaultForm.value}
+                  onChange={(event) => setVaultForm({ ...vaultForm, value: event.target.value })}
+                  rows={2}
+                  required
+                  placeholder={
+                    editingSecretKey
+                      ? "Enter a new value to update this secret"
+                      : "the raw secret value — encrypted at rest"
+                  }
+                />
+              </label>
+              <div className="modal-footer" style={{ marginTop: 4 }}>
+                {editingSecretKey && (
+                  <button type="button" className="button button-ghost" onClick={cancelEditSecret}>
+                    Cancel
+                  </button>
+                )}
+                <button
+                  className="button button-primary"
+                  disabled={busy || !vaultForm.key.trim() || !vaultForm.value}
+                >
+                  {busy ? <Spinner /> : editingSecretKey ? "Update secret" : "Add secret"}
+                </button>
+              </div>
+            </form>
+            <div className="vault-grid">
+              {secrets.map((s) => (
+                <div className="vault-card" key={s.key}>
+                  <div className="vault-card-head">
+                    <code className="vault-key">{s.key}</code>
+                    <div className="secrets-card-actions">
+                      <button
+                        className="button button-ghost"
+                        style={{ minHeight: 28, fontSize: 10, padding: "0 8px" }}
+                        onClick={() => editSecret(s.key)}
+                        disabled={busy}
+                      >
+                        Edit
+                      </button>
+                      <button
+                        className="perm-x"
+                        onClick={() => revokeSecret(s.key)}
+                        disabled={busy}
+                        title="Delete secret"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  </div>
+                  <div className="vault-redacted">{s.redactedView}</div>
+                </div>
+              ))}
+              {secrets.length === 0 && <div className="perm-empty">No secrets yet.</div>}
+            </div>
+          </section>
+        ) : selected ? (
           <>
             <header className="agent-header">
               <div>
@@ -1100,6 +1238,7 @@ export default function App() {
         )}
       </main>
 
+      {currentRole !== "admin" && (
       <aside className="policy-console">
         {selected ? (
           <>
@@ -1206,88 +1345,18 @@ export default function App() {
                   <div>
                     <span className="eyebrow">Vault</span>
                   </div>
-                  {currentRole === "admin" && (
-                    <button
-                      className="button button-ghost"
-                      style={{ minHeight: 30, fontSize: 11, padding: "0 10px" }}
-                      onClick={() => {
-                        setVaultForm({ key: "", value: "", redactedView: "" });
-                        setShowVaultForm((v) => !v);
-                      }}
-                    >
-                      {showVaultForm ? "Close" : "＋ Add secret"}
-                    </button>
-                  )}
                 </div>
 
-                {currentRole !== "admin" && (
-                  <div className="perm-empty">
-                    Only admins may manage secrets. You can view the catalog read-only.
-                  </div>
-                )}
-
-                {currentRole === "admin" && showVaultForm && (
-                  <form className="vault-form" onSubmit={addSecret}>
-                    <label>
-                      Key
-                      <input
-                        value={vaultForm.key}
-                        onChange={(event) =>
-                          setVaultForm({ ...vaultForm, key: event.target.value })
-                        }
-                        required
-                        maxLength={120}
-                        placeholder="dev-db-url"
-                      />
-                    </label>
-                    <label>
-                      Value
-                      <textarea
-                        value={vaultForm.value}
-                        onChange={(event) =>
-                          setVaultForm({ ...vaultForm, value: event.target.value })
-                        }
-                        rows={2}
-                        required
-                      />
-                    </label>
-                    <label>
-                      Redacted label (optional)
-                      <input
-                        value={vaultForm.redactedView}
-                        onChange={(event) =>
-                          setVaultForm({ ...vaultForm, redactedView: event.target.value })
-                        }
-                        maxLength={200}
-                        placeholder="postgres://***:***@db/agentdb"
-                      />
-                    </label>
-                    <div className="modal-footer" style={{ marginTop: 4 }}>
-                      <button
-                        className="button button-primary"
-                        disabled={busy || !vaultForm.key.trim() || !vaultForm.value}
-                      >
-                        {busy ? <Spinner /> : "Save secret"}
-                      </button>
-                    </div>
-                  </form>
-                )}
+                <div className="perm-empty">
+                  Secrets are centralized and admin-managed. This is the read-only catalog
+                  (redacted views only — the raw value never leaves the server).
+                </div>
 
                 <div className="vault-grid">
                   {secrets.map((s) => (
                     <div className="vault-card" key={s.key}>
                       <div className="vault-card-head">
                         <code className="vault-key">{s.key}</code>
-                        {currentRole === "admin" && (
-                          <button
-                            className="perm-x"
-                            onClick={() => revokeSecret(s.key)}
-                            disabled={busy}
-                            title="Revoke secret"
-                          >
-                            ×
-                          </button>
-                        )}
                       </div>
                       <div className="vault-redacted">{s.redactedView}</div>
                     </div>
@@ -1503,6 +1572,7 @@ export default function App() {
           <div className="perm-empty">Select an agent to see its permissions + decisions.</div>
         )}
       </aside>
+      )}
 
       {showCreate && (
         <div className="modal-backdrop" onMouseDown={() => setShowCreate(false)}>
@@ -1952,6 +2022,46 @@ export default function App() {
                   </div>
                 )}
               </section>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showAdmin && currentRole !== "admin" && (
+        <div className="modal-backdrop" onMouseDown={() => setShowAdmin(false)}>
+          <div
+            className="modal"
+            style={{ width: "min(520px, 100%)" }}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="modal-heading">
+              <div>
+                <span className="eyebrow">My permissions</span>
+                <h2>{currentUser}</h2>
+                <p>The permissions you inherit. Ask an admin to grant more.</p>
+              </div>
+              <button type="button" onClick={() => setShowAdmin(false)}>
+                ×
+              </button>
+            </div>
+            <div className="owner-scope-list">
+              {myScopes.length === 0 ? (
+                <div className="perm-empty">
+                  You have no inherent permissions. An admin can grant them.
+                </div>
+              ) : (
+                myScopes.map((scope) => {
+                  const risk = classifyScopeClient(scope);
+                  return (
+                    <div className="owner-scope" key={scope}>
+                      <span
+                        className={"mini-dot mini-" + (risk === "baseline" ? "ready" : "warning")}
+                      />
+                      <code>{scope}</code>
+                    </div>
+                  );
+                })
+              )}
             </div>
           </div>
         </div>

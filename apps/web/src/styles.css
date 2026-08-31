@@ -1884,3 +1884,47 @@ textarea:focus {
     grid-template-columns: 1fr;
   }
 }
+
+/* === Admin secrets console + role-aware shell === */
+.app-shell-wide {
+  grid-template-columns: 276px minmax(0, 1fr);
+}
+
+.secrets-panel {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 4px 0 32px;
+}
+
+.secrets-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.secrets-head h1 {
+  font-family: ui-rounded, "SF Pro Rounded", system-ui, sans-serif;
+  font-size: 22px;
+  margin: 2px 0 0;
+  letter-spacing: -0.03em;
+}
+
+.secrets-form-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.secrets-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+@media (max-width: 760px) {
+  .secrets-form-row {
+    grid-template-columns: 1fr;
+  }
+}
