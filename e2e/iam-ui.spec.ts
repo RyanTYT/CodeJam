@@ -55,6 +55,7 @@ test.describe("IAM audit log UI", () => {
     await page.getByRole("button", { name: "Logs", exact: true }).click();
 
     await expect(page.getByText("Agent log stream")).toBeVisible();
+    await page.getByRole("button", { name: /Expand/ }).click();
     const rows = page.locator(".log-list-item");
     await expect(rows.first()).toBeVisible();
     await expect(rows.first()).toContainText("alice");

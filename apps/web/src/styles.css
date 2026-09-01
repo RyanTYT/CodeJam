@@ -2585,6 +2585,10 @@ textarea:focus {
   grid-template-columns: 276px minmax(0, 1fr) minmax(280px, 360px);
 }
 
+.app-shell-admin:not(.app-shell-wide) {
+  grid-template-columns: 276px minmax(0, 1fr);
+}
+
 .admin-audit-panel {
   display: flex;
   flex-direction: column;
