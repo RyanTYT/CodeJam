@@ -452,12 +452,13 @@ export class MockResourceService {
     };
 
     if (agent) {
+      const effectiveAgent = { ...agent, scopes: credential.scopes };
       // Calculate agent risk profile
-      const agentProfile = calculateAgentRiskProfile(agent, recentAudit);
+      const agentProfile = calculateAgentRiskProfile(effectiveAgent, recentAudit);
       
       // Assess operation risk
       const operationAssessment = assessOperationRisk(
-        agent,
+        effectiveAgent,
         agentProfile,
         scope.resource,
         scope.scope,
@@ -602,13 +603,16 @@ export class MockResourceService {
       ? database.audit.filter((entry) => entry.agentId === credential.agentId).slice(-20)
       : [];
     const assessment = agent && derived
-      ? assessOperationRisk(
-          agent,
-          calculateAgentRiskProfile(agent, recentAudit),
+      ? (() => {
+          const effectiveAgent = { ...agent, scopes: credential?.scopes ?? [] };
+          return assessOperationRisk(
+          effectiveAgent,
+          calculateAgentRiskProfile(effectiveAgent, recentAudit),
           derived.resource,
           derived.scope,
           recentAudit,
-        )
+          );
+        })()
       : null;
     await this.writeAudit({
       humanPrincipalId: credential ? "user:" + credential.ownerId : "unknown",

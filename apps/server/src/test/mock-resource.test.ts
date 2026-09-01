@@ -431,10 +431,27 @@ describe("boundary 3 — HTTP routes", () => {
 
 describe("user-scope delegation gating (admin grant -> agent access)", () => {
   it("lets an owner's agent read a secret they were granted, and denies one they weren't", async () => {
-    const { service } = await makeService();
+    const { service, store } = await makeService();
     // Admin adds a secret; Alice is granted access, Bob is NOT.
     await service.addSecret("flag", "ACCESS_GRANTED_42", "ACCESS_********_42");
     await service.grantUserScope("alice", "read:secrets:flag");
+    await store.mutate((db) => {
+      db.agents.push({
+        id: "bob-agent",
+        name: "Bob's access test",
+        description: "",
+        instructions: "",
+        status: "ready",
+        ownerId: "bob",
+        scopes: ["read:secrets:flag"],
+        plan: null,
+        workspacePath: "/tmp/bob-agent",
+        codexThreadId: null,
+        lastError: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+    });
 
     // Alice's agent delegates read:secrets:flag — Alice holds it, so the
     // credential keeps it -> the relay allows (200).
@@ -457,6 +474,12 @@ describe("user-scope delegation gating (admin grant -> agent access)", () => {
     );
     const bobRes = await service.relay("GET", "secrets/flag", undefined, bobToken);
     expect(bobRes.status).toBe(403);
+    expect(service.listAudit("bob-agent").find((entry) => entry.decision === "deny"))
+      .toMatchObject({
+        scope: "read:secrets:flag",
+        operationRiskLevel: "high",
+        operationRiskFactors: expect.arrayContaining(["required scope was not granted"]),
+      });
   });
 
   it("admin owners bypass the delegation filter (delegate any scope)", async () => {
