@@ -92,6 +92,11 @@ export class MockResourceService {
 
   async initialize(): Promise<void> {
     await this.store.mutate((db) => {
+      for (const resource of db.mockResources) {
+        if (!resource.value.startsWith("v1:")) {
+          resource.value = encrypt(resource.value, this.config.secretsKey);
+        }
+      }
       if (db.mockResources.length === 0) {
         db.mockResources.push(
           ...SEED_RESOURCES.map((resource) => ({
@@ -99,14 +104,6 @@ export class MockResourceService {
             value: encrypt(resource.value, this.config.secretsKey),
           })),
         );
-      }
-      // Older stores kept resource values as plaintext. Encrypt these records
-      // during startup so legacy data can still be served through the current
-      // redacting relay instead of failing when `decrypt` expects v1 ciphertext.
-      for (const resource of db.mockResources) {
-        if (!resource.value.startsWith("v1:")) {
-          resource.value = encrypt(resource.value, this.config.secretsKey);
-        }
       }
       if (db.deployStates.length === 0) {
         db.deployStates.push(...SEED_DEPLOYS.map((state) => ({ ...state })));
@@ -387,11 +384,6 @@ export class MockResourceService {
       await this.auditDeny(method, path, credential, "unknown resource", null);
       return { status: 404, body: { error: "unknown resource" } };
     }
-    // if (!credential.scopes.includes(scope.scope)) {
-    //   await this.auditDeny(method, path, credential, "scope mismatch", scope.scope);
-    //   return { status: 403, body: { error: "scope mismatch", scope: scope.scope } };
-    // }
-
     // 3. Normalize credential into AuthorizationContext
     const context = this.credentialToContext(credential);
 
@@ -447,10 +439,9 @@ export class MockResourceService {
       humanPrincipalId: "user:" + credential.ownerId,
       agentId: credential.agentId,
       agentPrincipalId: "agent:" + credential.agentId,
-      agentName: agent?.name ?? null,
       planId: null,
       planHash: null,
-      capability: `${requestedCapability.action}:${requestedCapability.resource}:${requestedCapability.scope}`,
+      capability: scope.scope,
       runId: credential.runId,
       method,
       action: scope.verb,
@@ -580,7 +571,15 @@ export class MockResourceService {
   }
 
   async writeAudit(entry: Omit<Audit, "id" | "timestamp">): Promise<Audit> {
-    const audit: Audit = { ...entry, id: randomUUID(), timestamp: now() };
+    const agent = entry.agentId
+      ? this.store.snapshot().agents.find((item) => item.id === entry.agentId)
+      : undefined;
+    const audit: Audit = {
+      ...entry,
+      agentName: entry.agentName ?? agent?.name ?? null,
+      id: randomUUID(),
+      timestamp: now(),
+    };
     await this.store.mutate((db) => {
       db.audit.push(audit);
     });
@@ -597,18 +596,27 @@ export class MockResourceService {
     const derived = this.deriveScope(method, path);
     const database = this.store.snapshot();
     const agent = credential
-      ? database.agents.find((entry) => entry.id === credential.agentId)
+      ? database.agents.find((item) => item.id === credential.agentId)
       : undefined;
-    const auditEntry: Omit<Audit, "id" | "timestamp"> = {
+    const recentAudit = credential
+      ? database.audit.filter((entry) => entry.agentId === credential.agentId).slice(-20)
+      : [];
+    const assessment = agent && derived
+      ? assessOperationRisk(
+          agent,
+          calculateAgentRiskProfile(agent, recentAudit),
+          derived.resource,
+          derived.scope,
+          recentAudit,
+        )
+      : null;
+    await this.writeAudit({
       humanPrincipalId: credential ? "user:" + credential.ownerId : "unknown",
       agentId: credential?.agentId ?? null,
       agentPrincipalId: credential ? "agent:" + credential.agentId : null,
-      agentName: agent?.name ?? null,
       planId: null,
       planHash: null,
-      capability: derived
-        ? `${derived.verb}:${derived.resource}:${derived.scope}`
-        : null,
+      capability: derived?.scope ?? null,
       runId: credential?.runId ?? null,
       method,
       action: derived?.verb ?? "unknown",
@@ -616,23 +624,14 @@ export class MockResourceService {
       scope: scope ?? derived?.scope ?? null,
       decision: "deny",
       reason,
-    };
-    if (agent && derived) {
-      const recentAudit = database.audit
-        .filter((entry) => entry.agentId === credential?.agentId)
-        .slice(-20);
-      const assessment = assessOperationRisk(
-        agent,
-        calculateAgentRiskProfile(agent, recentAudit),
-        derived.resource,
-        derived.scope,
-        recentAudit,
-      );
-      auditEntry.operationRiskLevel = assessment.operationRiskLevel;
-      auditEntry.operationRiskScore = assessment.operationRiskScore;
-      auditEntry.operationRiskFactors = assessment.operationRiskFactors;
-    }
-    await this.writeAudit(auditEntry);
+      ...(assessment
+        ? {
+            operationRiskLevel: assessment.operationRiskLevel,
+            operationRiskScore: assessment.operationRiskScore,
+            operationRiskFactors: assessment.operationRiskFactors,
+          }
+        : {}),
+    });
   }
 
   /* Normalizes the current AgentCredential representation into the
@@ -764,17 +763,9 @@ export class MockResourceService {
   }
 
   listAudit(agentId?: string): Audit[] {
-    const database = this.store.snapshot();
-    const all = database.audit;
+    const all = this.store.snapshot().audit;
     const filtered = agentId ? all.filter((entry) => entry.agentId === agentId) : all;
-    return filtered
-      .map((entry) => ({
-        ...entry,
-        agentName: entry.agentName ?? (entry.agentId
-          ? database.agents.find((agent) => agent.id === entry.agentId)?.name ?? null
-          : null),
-      }))
-      .sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+    return [...filtered].sort((left, right) => right.timestamp.localeCompare(left.timestamp));
   }
 
 }

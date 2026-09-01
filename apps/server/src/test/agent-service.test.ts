@@ -278,6 +278,61 @@ describe("Agent lifecycle", () => {
     finish({ output: "done", threadId: "thread", usage: null });
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
   });
+
+  it("deduplicates repeated progress events and adds one response-ready event", async () => {
+    const event = {
+      id: "progress-1",
+      type: "command_execution",
+      label: "Command",
+      summary: "ran tests",
+      timestamp: new Date().toISOString(),
+    };
+    const runner: AgentRunner = {
+      run: async (request) => {
+        await request.onProgress?.(event);
+        await request.onProgress?.(event);
+        return { output: "done", threadId: "thread", usage: null, progress: [event] };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const service = await makeService(runner);
+    const agent = await service.createAgent({ name: "Progress" });
+
+    const { run } = await service.sendMessage(agent.id, "run tests");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    const progress = service.getRun(run.id).progress;
+    expect(progress.filter((item) => item.id === event.id)).toHaveLength(1);
+    expect(progress.filter((item) => item.type === "response_ready")).toHaveLength(1);
+  });
+
+  it("keeps user progress visible and fails the workflow when the runner errors", async () => {
+    const event = {
+      id: "progress-before-failure",
+      type: "file_search_call",
+      label: "File search",
+      summary: "inspected the workspace",
+      timestamp: new Date().toISOString(),
+    };
+    const service = await makeService({
+      run: async (request) => {
+        await request.onProgress?.(event);
+        throw new Error("runner failed");
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Failure" });
+
+    const { run } = await service.sendMessage(agent.id, "inspect files");
+    await expect.poll(() => service.getRun(run.id).status).toBe("failed");
+
+    expect(service.getMessages(agent.id)).toHaveLength(1);
+    expect(service.getRun(run.id).progress).toEqual(expect.arrayContaining([event]));
+    expect(service.getWorkflow(run.id).every((node) => node.status === "failed")).toBe(true);
+    expect(service.getRun(run.id).progress.some((item) => item.type === "response_ready")).toBe(false);
+  });
 });
 
 describe("Bouncer ownership boundary (boundary 2)", () => {
@@ -344,6 +399,26 @@ describe("Bouncer ownership boundary (boundary 2)", () => {
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
   });
 
+  it("limits unfiltered audit history to owned agents and the caller's own control-plane events", async () => {
+    const service = await makeService();
+    const alice = principal("alice");
+    const bob = principal("bob");
+    const aliceAgent = await service.createAgent({ name: "Alice audit agent" }, alice);
+    const bobAgent = await service.createAgent({ name: "Bob audit agent" }, bob);
+    await service.planIntent("read my database", alice);
+
+    const aliceAudit = service.listAudit(undefined, alice);
+    expect(aliceAudit.some((entry) => entry.agentId === aliceAgent.id)).toBe(true);
+    expect(aliceAudit.some((entry) => entry.agentId === bobAgent.id)).toBe(false);
+    expect(aliceAudit.some((entry) => entry.action === "plan")).toBe(true);
+
+    const admin = service.resolvePrincipal("admin");
+    if (!admin) throw new Error("seed admin missing");
+    const globalAudit = service.listAudit(undefined, admin);
+    expect(globalAudit.some((entry) => entry.agentId === aliceAgent.id)).toBe(true);
+    expect(globalAudit.some((entry) => entry.agentId === bobAgent.id)).toBe(true);
+  });
+
   it("plans intent-bound scopes from a stated intent (fallback planner)", async () => {
     const service = await makeService(new FakeRunner(), { arklessPlanner: true });
     const alice = principal("alice");
@@ -355,7 +430,7 @@ describe("Bouncer ownership boundary (boundary 2)", () => {
     expect(plan.baselineScopes).toContain("read:secrets:dev-db-url");
     expect(plan.baselineScopes).toContain("act:deploy:dev");
     expect(plan.elevatedScopes).toEqual([]);
-    expect(service.listAudit().some((row) => row.action === "plan")).toBe(true);
+    expect(service.listAudit(undefined, alice).some((row) => row.action === "plan")).toBe(true);
   });
 
   it("stores the approved scopes on the Agent (reduced when an elevated scope is denied)", async () => {
@@ -419,7 +494,7 @@ describe("User permission management (inherent scopes)", () => {
     expect(
       service.listUsers().find((u) => u.userId === "alice")?.scopes,
     ).toContain("act:deploy:prod");
-    expect(service.listAudit().some((row) => row.action === "grant-scope")).toBe(true);
+    expect(service.listAudit(undefined, admin).some((row) => row.action === "grant-scope")).toBe(true);
   });
 
   it("revokes a scope from a user and audits the revoke (admin)", async () => {
@@ -432,7 +507,7 @@ describe("User permission management (inherent scopes)", () => {
       service.listUsers().find((u) => u.userId === "alice")?.scopes,
     ).not.toContain("act:deploy:dev");
     expect(
-      service.listAudit().some((row) => row.action === "revoke-user-scope"),
+      service.listAudit(undefined, admin).some((row) => row.action === "revoke-user-scope"),
     ).toBe(true);
   });
 

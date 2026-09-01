@@ -391,8 +391,21 @@ export class AgentService {
     agentId: string | undefined,
     principal: Principal = defaultPrincipal(),
   ): Audit[] {
-    if (agentId) this.getAgent(agentId, principal);
-    return this.mockResourceService.listAudit(agentId);
+    if (agentId) {
+      this.getAgent(agentId, principal);
+      return this.mockResourceService.listAudit(agentId);
+    }
+    if (principal.role === "admin") return this.mockResourceService.listAudit();
+    const ownedAgentIds = new Set(
+      this.listAgents(principal).map((agent) => agent.id),
+    );
+    return this.mockResourceService
+      .listAudit()
+      .filter(
+        (entry) =>
+          (entry.agentId !== null && ownedAgentIds.has(entry.agentId)) ||
+          (entry.agentId === null && entry.humanPrincipalId === principal.id),
+      );
   }
 
   /** Vault — centralized secrets (encrypted at rest, redacted views only).

@@ -78,7 +78,13 @@ describe("boundary 3 — relay policy", () => {
     const allow = service
       .listAudit("agent-1")
       .find((row) => row.decision === "allow" && row.action === "read");
-    expect(allow).toBeTruthy();
+    expect(allow).toMatchObject({
+      humanPrincipalId: "user:alice",
+      agentPrincipalId: "agent:agent-1",
+      runId: "run-1",
+      capability: "read:secrets:dev-db-url",
+      scope: "read:secrets:dev-db-url",
+    });
   });
 
   it("denies a scope mismatch with 403, never reaches upstream, and audits deny", async () => {
@@ -158,6 +164,44 @@ describe("boundary 3 — relay policy", () => {
     expect(
       (await service.relay("GET", "secrets/alice/db-url", undefined, "bogus")).status,
     ).toBe(401);
+    expect(service.listAudit().filter((row) => row.reason === "missing token")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ agentId: null, agentPrincipalId: null, humanPrincipalId: "unknown" }),
+      ]),
+    );
+  });
+
+  it("records an understandable denial for an unknown protected resource", async () => {
+    const { service } = await makeService();
+    const { token } = await service.mintCredential("agent-1", "run-1", "alice", ["read:secrets:dev-db-url"]);
+
+    const result = await service.relay("GET", "unsupported/resource", undefined, token);
+
+    expect(result.status).toBe(404);
+    expect(service.listAudit("agent-1").at(-1)).toMatchObject({
+      decision: "deny",
+      reason: "unknown resource",
+      resource: "unsupported/resource",
+      capability: null,
+    });
+  });
+
+  it("does not let a read scope write a secret or change its protected value", async () => {
+    const { service, store } = await makeService();
+    const { token } = await service.mintCredential("agent-1", "run-1", "alice", [
+      "read:secrets:dev-db-url",
+    ]);
+    const before = store.snapshot().mockResources.find((entry) => entry.key === "dev-db-url")?.value;
+
+    const result = await service.relay("PUT", "secrets/dev-db-url", "changed", token);
+
+    expect(result.status).toBe(403);
+    expect(store.snapshot().mockResources.find((entry) => entry.key === "dev-db-url")?.value).toBe(before);
+    expect(service.listAudit("agent-1").at(-1)).toMatchObject({
+      decision: "deny",
+      capability: "write:secrets:dev-db-url",
+      scope: "write:secrets:dev-db-url",
+    });
   });
 
   it("allows a scoped deploy (dev) and denies prod, leaving prod untouched", async () => {
