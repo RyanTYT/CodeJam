@@ -8,8 +8,30 @@ runtime_image="${CONTAINER_RUNTIME_IMAGE:-volc-agent-runtime:local}"
 runtime_base_image="${CONTAINER_RUNTIME_BASE_IMAGE:-node:22-bookworm-slim}"
 runtime_apt_mirror="${CONTAINER_APT_MIRROR:-}"
 runtime_apt_security_mirror="${CONTAINER_APT_SECURITY_MIRROR:-}"
-runtime_apt_packages="${CONTAINER_RUNTIME_APT_PACKAGES:-ca-certificates git ripgrep}"
+runtime_apt_packages="${CONTAINER_RUNTIME_APT_PACKAGES:-ca-certificates curl git python3 ripgrep}"
 codex_sandbox_mode="${CODEX_SANDBOX_MODE:-workspace-write}"
+host_os="$(uname -s)"
+
+# Git Bash rewrites Linux-looking arguments before starting Docker. A mount
+# destination such as dst=/workspace would become C:/Program Files/Git/workspace.
+# Pass Windows-form host paths and disable that rewrite for container commands.
+if [[ "$host_os" == MINGW* || "$host_os" == MSYS* || "$host_os" == CYGWIN* ]]; then
+  mount_path() {
+    cygpath -am "$1"
+  }
+
+  run_container_engine() {
+    MSYS_NO_PATHCONV=1 "$engine" "$@"
+  }
+else
+  mount_path() {
+    printf '%s' "$1"
+  }
+
+  run_container_engine() {
+    "$engine" "$@"
+  }
+fi
 
 log() {
   printf '[local-poc] %s\n' "$*" >&2
@@ -26,7 +48,7 @@ detect_engine() {
       return 1
     }
     engine_works "$CONTAINER_ENGINE" || {
-      log "$CONTAINER_ENGINE is installed but its service is not running."
+      log "CONTAINER_ENGINE=$CONTAINER_ENGINE is installed but its service is not running."
       return 1
     }
     printf '%s' "$CONTAINER_ENGINE"
@@ -109,6 +131,8 @@ export RUNTIME_INSTANCE_ID="${RUNTIME_INSTANCE_ID:-local-$(id -u)-$(printf '%s' 
 mkdir -p "$APP_DATA_DIR" "$AGENT_WORKSPACE_ROOT" "$CODEX_HOME"
 log "Persistent state: $local_state_root"
 export CONTAINER_USER="${CONTAINER_USER:-$(id -u):$(id -g)}"
+workspace_mount_source="$(mount_path "$AGENT_WORKSPACE_ROOT")"
+codex_home_mount_source="$(mount_path "$CODEX_HOME")"
 
 log "Building $runtime_image from Dockerfile.runtime (base: $runtime_base_image)."
 "$engine" build \
@@ -125,10 +149,10 @@ preflight_user_args=(--user "$CONTAINER_USER")
 if [[ "$(basename "$engine")" == "podman" ]]; then
   preflight_user_args+=(--userns keep-id)
 fi
-if ! "$engine" run --rm \
+if ! run_container_engine run --rm \
   "${preflight_user_args[@]}" \
-  --mount "type=bind,src=$AGENT_WORKSPACE_ROOT,dst=/workspace" \
-  --mount "type=bind,src=$CODEX_HOME,dst=/codex-home" \
+  --mount "type=bind,src=$workspace_mount_source,dst=/workspace" \
+  --mount "type=bind,src=$codex_home_mount_source,dst=/codex-home" \
   "$runtime_image" sh -lc \
     'touch /workspace/.launchpad-write-test /codex-home/.launchpad-write-test && rm /workspace/.launchpad-write-test /codex-home/.launchpad-write-test'; then
   log "The container engine cannot mount $local_state_root."
@@ -137,7 +161,7 @@ if ! "$engine" run --rm \
 fi
 
 if [[ "$codex_sandbox_mode" == "workspace-write" ]] \
-  && ! "$engine" run --rm "$runtime_image" \
+  && ! run_container_engine run --rm "$runtime_image" \
     codex sandbox linux --full-auto -- true >/dev/null 2>&1; then
   log "Codex Landlock is unavailable in this Linux Runtime."
   log "Falling back to danger-full-access inside the disposable container boundary."
