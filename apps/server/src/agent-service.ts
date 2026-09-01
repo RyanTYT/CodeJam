@@ -4,19 +4,27 @@ import { isArkConfigured } from "./config.js";
 import { startEgressProxy, type EgressProxy } from "./egress-proxy.js";
 import { HttpError, RunCancelledError } from "./errors.js";
 import type { MockResourceService } from "./mock-resource-service.js";
+import type { IntentPlanner } from "./intent-planner.js";
 import { JsonStore } from "./store.js";
 import type {
   Agent,
+  AgentCredential,
+  AgentProgressEvent,
   AgentRun,
   AgentRunner,
   Audit,
   CreateAgentInput,
+  IntentPlan,
   Message,
   Principal,
   RunnerRequest,
+  Secret,
   UpdateAgentInput,
+  WorkflowNode,
+  User,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
+import { calculateAgentRiskProfile } from "./risk-engine.js";
 
 const now = () => new Date().toISOString();
 
@@ -25,6 +33,7 @@ export const defaultPrincipal = (): Principal => ({
   kind: "human",
   id: "user:default",
   userId: "default",
+  role: "user",
   runId: undefined,
   scopes: [],
   expiresAt: undefined,
@@ -48,6 +57,7 @@ export class AgentService {
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
     private readonly mockResourceService: MockResourceService,
+    private readonly intentPlanner: IntentPlanner,
   ) {}
 
   async initialize(): Promise<void> {
@@ -94,13 +104,19 @@ export class AgentService {
     const timestamp = now();
     const id = randomUUID();
     const ownerId = principal.userId ?? "default";
+    const scopes =
+      input.scopes && input.scopes.length > 0
+        ? [...new Set(input.scopes)]
+        : [`read:secrets:${ownerId}`, "act:deploy:dev"];
     const agent: Agent = {
       id,
       name: input.name.trim(),
-      description: input.description?.trim() ?? "",
+      description: input.description?.trim() || input.intent?.trim() || "",
       instructions: input.instructions?.trim() ?? "",
       status: "ready",
       ownerId,
+      scopes,
+      plan: input.plan ?? null,
       workspacePath: this.workspaces.workspacePath(id),
       codexThreadId: null,
       lastError: null,
@@ -108,9 +124,46 @@ export class AgentService {
       updatedAt: timestamp,
     };
     await this.workspaces.create(agent);
-    await this.store.mutate((database) => database.agents.push(agent));
-    await this.audit(principal, agent.id, "create", `agent:${agent.id}`, "allow", "owner");
+    await this.store.mutate((database) => {
+      database.agents.push(agent);
+      
+      // Phase 2: Calculate and store initial risk profile
+      const riskProfile = calculateAgentRiskProfile(agent, []);
+      database.agentRiskProfiles.push(riskProfile);
+    });
+    await this.audit(
+      principal,
+      agent.id,
+      "create",
+      `agent:${agent.id}`,
+      "allow",
+      `owner; scopes: ${scopes.join(", ")}`,
+    );
     return agent;
+  }
+
+  /**
+   * Intent-bound permissions planning: ask the planner for the minimum scopes
+   * the stated intent needs, classify them (baseline/elevated/unknown), and
+   * audit the proposal. The UI then asks the user to approve the elevated
+   * subset before createAgent stores the approved scopes on the Agent.
+   */
+  async planIntent(
+    intent: string,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<IntentPlan> {
+    const ownerId = principal.userId ?? "default";
+    const secretKeys = this.mockResourceService.listSecretKeys();
+    const plan = await this.intentPlanner.plan(intent, secretKeys);
+    await this.audit(
+      principal,
+      null,
+      "plan",
+      `intent:${intent.slice(0, 80)}`,
+      "allow",
+      `requested [${plan.requestedScopes.join(", ")}] baseline ${plan.baselineScopes.length} elevated ${plan.elevatedScopes.length} unknown ${plan.unknownScopes.length}; source ${plan.source}`,
+    );
+    return plan;
   }
 
   async updateAgent(
@@ -220,6 +273,7 @@ export class AgentService {
       output: null,
       error: null,
       usage: null,
+      progress: [],
       startedAt: null,
       completedAt: null,
       createdAt: timestamp,
@@ -243,8 +297,28 @@ export class AgentService {
       if (storedAgent.status === "busy") {
         throw new HttpError(409, "This Agent is already running");
       }
+      const riskProfile = database.agentRiskProfiles.find((profile) => profile.agentId === agentId);
+      const orchestratorNode: WorkflowNode = {
+        id: randomUUID(),
+        type: "orchestrator",
+        runId: run.id,
+        status: "running",
+        riskLevel: riskProfile?.agentRiskLevel ?? "low",
+        createdAt: timestamp,
+      };
+      const taskNode: WorkflowNode = {
+        id: randomUUID(),
+        type: "task",
+        parentId: orchestratorNode.id,
+        runId: run.id,
+        agentId: agentId,
+        status: "running",
+        riskLevel: riskProfile?.agentRiskLevel ?? "low",
+        createdAt: timestamp,
+      };
       database.runs.push(run);
       database.messages.push(message);
+      database.workflowNodes.push(orchestratorNode, taskNode);
       const snapshot = structuredClone(storedAgent);
       storedAgent.status = "busy";
       storedAgent.lastError = null;
@@ -274,12 +348,218 @@ export class AgentService {
     return { revoked };
   }
 
+  /**
+   * Per-scope revocation: remove a single scope from the agent's stored set.
+   * Affects future runs (the active run's credential was minted at start);
+   * the next run's credential won't include the removed scope → the relay 403s it.
+   */
+  async removeScope(
+    agentId: string,
+    scope: string,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<Agent> {
+    this.getAgent(agentId, principal);
+    const updated = await this.store.mutate((database) => {
+      const agent = database.agents.find((item) => item.id === agentId);
+      if (!agent) {
+        throw new HttpError(404, "Agent not found");
+      }
+      agent.scopes = agent.scopes.filter((entry) => entry !== scope);
+      agent.updatedAt = now();
+      return structuredClone(agent);
+    });
+    await this.audit(
+      principal,
+      agentId,
+      "revoke-scope",
+      `scope:${scope}`,
+      "allow",
+      `owner; removed ${scope}`,
+    );
+    return updated;
+  }
+
+  getWorkflow(runId: string, principal: Principal = defaultPrincipal()): WorkflowNode[] {
+    const run = this.getRun(runId, principal);
+    return this.store
+      .snapshot()
+      .workflowNodes.filter((node) => node.runId === run.id)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  }
+
   listAudit(
     agentId: string | undefined,
     principal: Principal = defaultPrincipal(),
   ): Audit[] {
-    if (agentId) this.getAgent(agentId, principal);
-    return this.mockResourceService.listAudit(agentId);
+    if (agentId) {
+      this.getAgent(agentId, principal);
+      return this.mockResourceService.listAudit(agentId);
+    }
+    if (principal.role === "admin") return this.mockResourceService.listAudit();
+    const ownedAgentIds = new Set(
+      this.listAgents(principal).map((agent) => agent.id),
+    );
+    return this.mockResourceService
+      .listAudit()
+      .filter(
+        (entry) =>
+          (entry.agentId !== null && ownedAgentIds.has(entry.agentId)) ||
+          (entry.agentId === null && entry.humanPrincipalId === principal.id),
+      );
+  }
+
+  /** Vault — centralized secrets (encrypted at rest, redacted views only).
+   *  Everyone sees the redacted catalog; only admins may add/delete. */
+  listSecrets(principal: Principal = defaultPrincipal()): Secret[] {
+    void principal;
+    return this.mockResourceService.listSecrets();
+  }
+
+  async addSecret(
+    key: string,
+    value: string,
+    redactedView: string | undefined,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<Secret> {
+    if (principal.role !== "admin") {
+      throw new HttpError(403, "Only admins may manage secrets");
+    }
+    const secret = await this.mockResourceService.addSecret(key, value, redactedView);
+    await this.audit(principal, null, "add-secret", `secret:${key}`, "allow", "admin");
+    return secret;
+  }
+
+  async deleteSecret(
+    key: string,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<{ deleted: boolean }> {
+    if (principal.role !== "admin") {
+      throw new HttpError(403, "Only admins may manage secrets");
+    }
+    const deleted = await this.mockResourceService.deleteSecret(key);
+    await this.audit(
+      principal,
+      null,
+      "revoke-secret",
+      `secret:${key}`,
+      deleted ? "allow" : "deny",
+      deleted ? "admin" : "not found",
+    );
+    return { deleted };
+  }
+
+  /** Resolve a mock-user userId to a Principal (with role) from the users store, or null. */
+  resolvePrincipal(userId: string): Principal | null {
+    const user = this.mockResourceService.resolveUser(userId);
+    if (!user) return null;
+    return {
+      kind: "human",
+      id: "user:" + user.userId,
+      userId: user.userId,
+      role: user.role,
+      runId: undefined,
+      scopes: [],
+      expiresAt: undefined,
+    };
+  }
+
+  listUsers(): User[] {
+    return this.mockResourceService.listUsers();
+  }
+
+  async addUser(
+    userId: string,
+    role: "admin" | "user",
+    scopes: readonly string[] = [],
+    principal: Principal = defaultPrincipal(),
+  ): Promise<User> {
+    if (principal.role !== "admin") {
+      throw new HttpError(403, "Only admins may add users");
+    }
+    if (this.mockResourceService.resolveUser(userId)) {
+      throw new HttpError(409, `User ${userId} already exists`);
+    }
+    const user = await this.mockResourceService.addUser(userId, role, scopes);
+    await this.audit(
+      principal,
+      null,
+      "add-user",
+      `user:${userId}`,
+      "allow",
+      `admin; role ${role}; scopes ${scopes.length}`,
+    );
+    return user;
+  }
+
+  /** Grant an inherent permission to a user (admin-managed + audited). */
+  async grantUserScope(
+    userId: string,
+    scope: string,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<User> {
+    if (principal.role !== "admin") {
+      throw new HttpError(403, "Only admins may manage user permissions");
+    }
+    const user = await this.mockResourceService.grantUserScope(userId, scope);
+    if (!user) {
+      throw new HttpError(404, "User not found");
+    }
+    await this.audit(
+      principal,
+      null,
+      "grant-scope",
+      `user:${userId};scope:${scope}`,
+      "allow",
+      `admin; granted ${scope}`,
+    );
+    return user;
+  }
+
+  /** Revoke an inherent permission from a user (admin-managed + audited). */
+  async revokeUserScope(
+    userId: string,
+    scope: string,
+    principal: Principal = defaultPrincipal(),
+  ): Promise<User> {
+    if (principal.role !== "admin") {
+      throw new HttpError(403, "Only admins may manage user permissions");
+    }
+    const user = await this.mockResourceService.revokeUserScope(userId, scope);
+    if (!user) {
+      throw new HttpError(404, "User not found");
+    }
+    await this.audit(
+      principal,
+      null,
+      "revoke-user-scope",
+      `user:${userId};scope:${scope}`,
+      "allow",
+      `admin; revoked ${scope}`,
+    );
+    return user;
+  }
+
+  /**
+   * Debug: mint a Tier-1 credential for a user (admin-only). Lets you test the
+   * relay enforcement (boundary 3) live — curl /mock/proxy/secrets/<key> with
+   * the returned token — without running an agent (which needs Ark/Codex).
+   * The credential's scopes are filtered by the owner's inherent User.scopes
+   * (admin bypasses), exactly like a real agent run.
+   */
+  async mintDebugCredential(
+    userId: string,
+    scopes: string[],
+    principal: Principal = defaultPrincipal(),
+  ): Promise<{ token: string; credential: AgentCredential }> {
+    if (principal.role !== "admin") {
+      throw new HttpError(403, "Only admins may mint debug credentials");
+    }
+    return this.mockResourceService.mintCredential(
+      "debug-agent",
+      "debug-run",
+      userId,
+      scopes,
+    );
   }
 
   async systemInfo(): Promise<Record<string, unknown>> {
@@ -321,7 +601,7 @@ export class AgentService {
           agentAtStart.id,
           run.id,
           agentAtStart.ownerId,
-          [`read:secrets:${agentAtStart.ownerId}`, "act:deploy:dev"],
+          agentAtStart.scopes,
         );
         proxy = await startEgressProxy({
           token: minted.token,
@@ -348,6 +628,17 @@ export class AgentService {
         workspacePath: agentAtStart.workspacePath,
         prompt: run.prompt,
         threadId: agentAtStart.codexThreadId,
+        onProgress: async (event) => {
+          await this.store.mutate((database) => {
+            const storedRun = database.runs.find((item) => item.id === run.id);
+            if (!storedRun) return;
+            storedRun.progress ??= [];
+            const exists = storedRun.progress.some((entry) => entry.id === event.id);
+            if (!exists) {
+              storedRun.progress.push(event);
+            }
+          });
+        },
       };
       if (proxy) {
         request.proxyPort = proxy.port;
@@ -357,6 +648,13 @@ export class AgentService {
       }
       const result = await this.runner.run(request);
       const completedAt = now();
+      const responseReadyEvent: AgentProgressEvent = {
+        id: `response-${run.id}`,
+        type: "response_ready",
+        label: "Response ready",
+        summary: "Codex returned a response to the user.",
+        timestamp: completedAt,
+      };
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
@@ -364,7 +662,20 @@ export class AgentService {
         storedRun.status = "completed";
         storedRun.output = result.output;
         storedRun.usage = result.usage;
+        const progress = [...(storedRun.progress ?? [])];
+        for (const event of [...(result.progress ?? []), responseReadyEvent]) {
+          if (!progress.some((existing) => existing.id === event.id)) {
+            progress.push(event);
+          }
+        }
+        storedRun.progress = progress;
         storedRun.completedAt = completedAt;
+        for (const node of database.workflowNodes) {
+          if (node.runId === run.id && node.status === "running") {
+            node.status = "completed";
+            node.completedAt = completedAt;
+          }
+        }
         database.messages.push({
           id: randomUUID(),
           agentId: agent.id,
@@ -389,6 +700,12 @@ export class AgentService {
           storedRun.status = cancelled ? "cancelled" : "failed";
           storedRun.error = message;
           storedRun.completedAt = completedAt;
+        }
+        for (const node of database.workflowNodes) {
+          if (node.runId === run.id && node.status === "running") {
+            node.status = "failed";
+            node.completedAt = completedAt;
+          }
         }
         if (agent) {
           if (agent.status !== "stopped") {
@@ -425,10 +742,14 @@ export class AgentService {
     reason: string,
     options: { runId?: string; method?: string; scope?: string; agentPrincipalId?: string } = {},
   ): Promise<void> {
+    const agentName = agentId
+      ? this.store.snapshot().agents.find((agent) => agent.id === agentId)?.name ?? null
+      : null;
     await this.mockResourceService.writeAudit({
       humanPrincipalId: principal.id,
       agentId,
       agentPrincipalId: options.agentPrincipalId ?? null,
+      agentName,
       runId: options.runId ?? null,
       method: options.method ?? null,
       action,

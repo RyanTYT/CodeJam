@@ -17,6 +17,14 @@ export interface ParsedEvents {
   threadId: string | null;
   usage: RunUsage | null;
   errors: string[];
+  events: Array<{
+    id: string;
+    type: string;
+    label: string;
+    summary: string;
+    detail?: string;
+    timestamp: string;
+  }>;
 }
 
 export function buildCodexArgs(
@@ -41,6 +49,74 @@ export function buildCodexArgs(
   return args;
 }
 
+function safeActivityText(value: string, maxLength = 240): string {
+  return value
+    .replace(/\b(?:sk|rk|ark)-[A-Za-z0-9_-]{8,}\b/gi, "[redacted]")
+    .replace(/\b(api[_-]?key|token|password|secret)\s*=\s*(?:"[^"]*"|'[^']*'|\S+)/gi, "$1=[redacted]")
+    .replace(/(postgres(?:ql)?:\/\/[^:\s]+:)[^@\s]+@/gi, "$1[redacted]@")
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [redacted]")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function maybeCaptureProgressEvent(
+  parsed: ParsedEvents,
+  item: Record<string, unknown>,
+): void {
+  if (!item || typeof item !== "object") return;
+  const type = typeof item.type === "string" ? item.type : "unknown";
+  const typeMap: Record<string, string> = {
+    file_edit_call: "File edit",
+    file_search_call: "File search",
+    command_execution: "Command",
+    command: "Command",
+    reasoning: "Reasoning",
+    plan: "Plan",
+    code_execution: "Validation",
+    validation: "Validation",
+  };
+  const label = typeMap[type] ??
+    (type.includes("file") ? "File action" : type.includes("command") ? "Command" : "Activity");
+  if (type === "agent_message") return;
+  const explicitSummary = typeof item.summary === "string"
+    ? safeActivityText(item.summary)
+    : typeof item.text === "string"
+      ? safeActivityText(item.text)
+      : undefined;
+  const command = typeof item.command === "string" && item.command.length > 0
+    ? safeActivityText(item.command)
+    : undefined;
+  const path = typeof item.path === "string" && item.path.length > 0
+    ? safeActivityText(item.path)
+    : undefined;
+  const output = typeof item.output === "string" && item.output.length > 0
+    ? safeActivityText(item.output, 160)
+    : undefined;
+  const isCommand = ["command_execution", "command", "code_execution", "validation"].includes(type);
+  const summary = isCommand
+    ? explicitSummary && explicitSummary !== command ? explicitSummary : "Ran command"
+    : explicitSummary ?? (path ? `Touched ${path}` : type);
+  const detail = isCommand
+    ? [command && `Command: ${command}`, output && `Output: ${output}`].filter(Boolean).join("\n") || undefined
+    : path && path !== summary ? path : undefined;
+  const event: {
+    id: string;
+    type: string;
+    label: string;
+    summary: string;
+    timestamp: string;
+    detail?: string;
+  } = {
+    id: `progress-${parsed.events.length + 1}`,
+    type,
+    label,
+    summary,
+    timestamp: new Date().toISOString(),
+    ...(detail !== undefined ? { detail } : {}),
+  };
+  parsed.events.push(event);
+}
+
 export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
   let event: Record<string, unknown>;
   try {
@@ -57,6 +133,8 @@ export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
     const item = event.item as Record<string, unknown>;
     if (item.type === "agent_message" && typeof item.text === "string") {
       parsed.messages.push(item.text);
+    } else {
+      maybeCaptureProgressEvent(parsed, item);
     }
   }
 
@@ -154,6 +232,7 @@ export class CodexRunner implements AgentRunner {
       threadId: request.threadId,
       usage: null,
       errors: [],
+      events: [],
     };
     let stdout = "";
     let stderr = "";
@@ -215,10 +294,15 @@ export class CodexRunner implements AgentRunner {
       if (!output) {
         throw new Error("Codex completed without an agent message");
       }
+      const progress = parsed.events;
+      for (const event of progress) {
+        await request.onProgress?.(event);
+      }
       return {
         output,
         threadId: parsed.threadId,
         usage: parsed.usage,
+        progress,
       };
     } finally {
       clearTimeout(timeout);

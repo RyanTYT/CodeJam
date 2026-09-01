@@ -1,4 +1,4 @@
-import type { Agent, AgentRun, Audit, Message, SystemInfo } from "./types";
+import type { Agent, AgentRun, Audit, IntentPlan, Message, Secret, SystemInfo, WorkflowNode, User } from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -44,12 +44,53 @@ export const api = {
   listAgents: () => request<{ agents: Agent[] }>("/api/agents"),
   createAgent: (body: {
     name: string;
-    description: string;
-    instructions: string;
+    description?: string;
+    instructions?: string;
+    intent?: string;
+    scopes?: string[];
+    plan?: IntentPlan;
   }) =>
     request<{ agent: Agent }>("/api/agents", {
       method: "POST",
       body: JSON.stringify(body),
+    }),
+  removeScope: (id: string, scope: string) =>
+    request<{ agent: Agent }>("/api/agents/" + id + "/scopes/revoke", {
+      method: "POST",
+      body: JSON.stringify({ scope }),
+    }),
+  listSecrets: () => request<{ secrets: Secret[] }>("/api/secrets"),
+  addSecret: (key: string, value: string, redactedView: string | undefined) =>
+    request<{ secret: Secret }>("/api/secrets", {
+      method: "POST",
+      body: JSON.stringify({ key, value, redactedView }),
+    }),
+  revokeSecret: (key: string) =>
+    request<{ deleted: boolean }>("/api/secrets/revoke", {
+      method: "POST",
+      body: JSON.stringify({ key }),
+    }),
+  listUsers: () => request<{ users: User[] }>("/api/users"),
+  addUser: (userId: string, role: "admin" | "user", scopes?: string[]) =>
+    request<{ user: User }>("/api/users", {
+      method: "POST",
+      body: JSON.stringify({ userId, role, scopes }),
+    }),
+  grantUserScope: (userId: string, scope: string) =>
+    request<{ user: User }>("/api/users/" + userId + "/scopes/grant", {
+      method: "POST",
+      body: JSON.stringify({ scope }),
+    }),
+  revokeUserScope: (userId: string, scope: string) =>
+    request<{ user: User }>("/api/users/" + userId + "/scopes/revoke", {
+      method: "POST",
+      body: JSON.stringify({ scope }),
+    }),
+  me: () => request<{ user: { userId: string; role: "admin" | "user" } }>("/api/me"),
+  planAgent: (intent: string) =>
+    request<{ plan: IntentPlan }>("/api/agents/plan", {
+      method: "POST",
+      body: JSON.stringify({ intent }),
     }),
   updateAgent: (
     id: string,
@@ -87,8 +128,8 @@ export const api = {
         body: JSON.stringify({ content }),
       },
     ),
-  run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),
-  audit: (agentId?: string) =>
+  run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),  workflow: (runId: string) =>
+    request<{ workflow: WorkflowNode[] }>("/api/runs/" + runId + "/workflow"),  audit: (agentId?: string) =>
     request<{ audit: Audit[] }>(
       "/api/audit" + (agentId ? "?agentId=" + encodeURIComponent(agentId) : ""),
     ),

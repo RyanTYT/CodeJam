@@ -1,11 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { createApp } from "./app.js";
-import { loadConfig } from "./config.js";
-import type { AgentService } from "./agent-service.js";
+import { createApp } from "../app.js";
+import { loadConfig } from "../config.js";
+import type { AgentService } from "../agent-service.js";
 
 const service = {
   listAgents: () => [],
   systemInfo: async () => ({}),
+  resolvePrincipal: () => ({
+    kind: "human" as const,
+    id: "user:default",
+    userId: "default",
+    role: "user" as const,
+    runId: undefined,
+    scopes: [],
+    expiresAt: undefined,
+  }),
 } as unknown as AgentService;
 
 describe("HTTP boundary", () => {

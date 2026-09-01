@@ -27,6 +27,14 @@ interface ParsedEvents {
   threadId: string | null;
   usage: RunUsage | null;
   errors: string[];
+  events: Array<{
+    id: string;
+    type: string;
+    label: string;
+    summary: string;
+    detail?: string;
+    timestamp: string;
+  }>;
 }
 
 export function containerName(agentId: string, instanceId = "default"): string {
@@ -42,13 +50,23 @@ export function buildContainerRunArgs(
   const name = containerName(request.agentId, config.runtimeInstanceId);
   const engineName = config.containerEngine.split(/[\\/]/).at(-1)?.toLowerCase();
   const arkHost = new URL(config.arkBaseUrl).host;
+  // curl reads LOWERCASE http_proxy/https_proxy/no_proxy for HTTP (uppercase
+  // HTTP_PROXY is ignored for http:// URLs — a long-standing curl quirk). Set
+  // both cases so curl (lowercase) and other tools (uppercase) both route
+  // through the egress proxy, which injects the Tier-1 token.
   const proxyEnv =
     typeof request.proxyPort === "number"
       ? [
           "--env",
+          `http_proxy=http://host.docker.internal:${request.proxyPort}`,
+          "--env",
           `HTTP_PROXY=http://host.docker.internal:${request.proxyPort}`,
           "--env",
+          `https_proxy=http://host.docker.internal:${request.proxyPort}`,
+          "--env",
           `HTTPS_PROXY=http://host.docker.internal:${request.proxyPort}`,
+          "--env",
+          `no_proxy=${arkHost}`,
           "--env",
           `NO_PROXY=${arkHost}`,
         ]
@@ -188,6 +206,7 @@ export class ContainerCodexRunner implements AgentRunner {
       threadId: request.threadId,
       usage: null,
       errors: [],
+      events: [],
     };
     let stdout = "";
     let stderr = "";
@@ -251,7 +270,11 @@ export class ContainerCodexRunner implements AgentRunner {
       }
       const output = parsed.messages.at(-1)?.trim();
       if (!output) throw new Error("Codex completed without an agent message");
-      return { output, threadId: parsed.threadId, usage: parsed.usage };
+      const progress = parsed.events;
+      for (const event of progress) {
+        await request.onProgress?.(event);
+      }
+      return { output, threadId: parsed.threadId, usage: parsed.usage, progress };
     } finally {
       clearTimeout(timeout);
       this.active.delete(request.agentId);

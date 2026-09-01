@@ -8,9 +8,14 @@ data/
 workspaces/
 codex-home/
 coverage/
+test-results/
+playwright-report/
 *.log
 *.tsbuildinfo
 .DS_Store
 deploy/volcengine/.terraform/
 deploy/volcengine/*.tfstate*
 deploy/volcengine/terraform.tfvars
+
+# Local dev
+setEnvVar.sh

@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Database } from "./types.js";
 
-const CURRENT_VERSION = 2;
+const CURRENT_VERSION = 3;
 
 const emptyDatabase = (): Database => ({
   version: CURRENT_VERSION,
@@ -13,19 +13,21 @@ const emptyDatabase = (): Database => ({
   mockResources: [],
   deployStates: [],
   audit: [],
+  users: [],
+  workflowNodes: [],
+  agentRiskProfiles: [],
 });
 
 /**
  * Migrate a parsed DB document to the current schema. v1 stores have no Bouncer
  * collections and no `ownerId` on agents; existing agents are attributed to the
  * synthetic "default" human principal so the baseline single-user experience
- * keeps working when X-Mock-User is absent. `version` is widened to number so
- * the v1->v2 branch is type-checkable even though the current Database type
- * pins version to the literal `2`.
+ * keeps working when X-Mock-User is absent. v2→v3 adds risk profiling and
+ * workflow hierarchy tracking for the audit trail feature.
  */
 function migrate(parsed: Partial<Database>): Database {
   const version = parsed.version as number | undefined;
-  if (version !== 1 && version !== CURRENT_VERSION) {
+  if (version !== 1 && version !== 2 && version !== CURRENT_VERSION) {
     throw new Error("Unsupported database format");
   }
   if (
@@ -35,10 +37,16 @@ function migrate(parsed: Partial<Database>): Database {
   ) {
     throw new Error("Unsupported database format");
   }
-  const agents = parsed.agents.map((agent) => ({
-    ...agent,
-    ownerId: agent.ownerId ?? "default",
-  }));
+  const agents = parsed.agents.map((agent) => {
+    const ownerId = agent.ownerId ?? "default";
+    const baseScopes = agent.scopes ?? [`read:secrets:${ownerId}`, "act:deploy:dev"];
+    return {
+      ...agent,
+      ownerId,
+      scopes: [...new Set(baseScopes)],
+      plan: agent.plan ?? null,
+    };
+  });
   if (version === CURRENT_VERSION) {
     return {
       version: CURRENT_VERSION,
@@ -46,21 +54,43 @@ function migrate(parsed: Partial<Database>): Database {
       messages: parsed.messages ?? [],
       runs: parsed.runs ?? [],
       credentials: parsed.credentials ?? [],
-      mockResources: parsed.mockResources ?? [],
+      mockResources: (parsed.mockResources ?? []).map((resource) => {
+        const legacy = resource as { owner?: unknown; key?: unknown };
+        const owner = typeof legacy.owner === "string" ? legacy.owner : "";
+        const key = typeof legacy.key === "string" ? legacy.key : "";
+        return {
+          key: owner.length > 0 ? `${owner}/${key}` : key,
+          value: resource.value,
+          redactedView: resource.redactedView,
+        };
+      }),
       deployStates: parsed.deployStates ?? [],
       audit: parsed.audit ?? [],
+      // Normalize legacy users that predate the per-user `scopes` field so the
+      // User type (scopes: string[]) always holds an array at runtime.
+      users: (parsed.users ?? []).map((user) => ({
+        ...user,
+        scopes: Array.isArray(user.scopes) ? user.scopes : [],
+      })),
+      workflowNodes: parsed.workflowNodes ?? [],
+      agentRiskProfiles: parsed.agentRiskProfiles ?? [],
     };
   }
-  return {
-    version: CURRENT_VERSION,
+  // v1 or v2 → v3 migration
+  const baseDatabase: Database = {
+    version: 3,
     agents,
     messages: parsed.messages ?? [],
     runs: parsed.runs ?? [],
-    credentials: [],
-    mockResources: [],
-    deployStates: [],
-    audit: [],
+    credentials: parsed.credentials ?? [],
+    mockResources: parsed.mockResources ?? [],
+    deployStates: parsed.deployStates ?? [],
+    audit: parsed.audit ?? [],
+    workflowNodes: [],
+    agentRiskProfiles: [],
+    users: [],
   };
+  return baseDatabase;
 }
 
 export class JsonStore {

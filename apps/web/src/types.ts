@@ -8,6 +8,8 @@ export interface Agent {
   instructions: string;
   status: AgentStatus;
   ownerId?: string;
+  scopes?: string[];
+  plan?: IntentPlan | null;
   workspacePath: string;
   codexThreadId: string | null;
   lastError: string | null;
@@ -36,6 +38,9 @@ export interface AgentRun {
     cachedInputTokens?: number;
     outputTokens?: number;
   } | null;
+  progress: AgentProgressEvent[];
+  startedAt: string | null;
+  completedAt: string | null;
   createdAt: string;
 }
 
@@ -45,6 +50,7 @@ export interface Audit {
   humanPrincipalId: string;
   agentId: string | null;
   agentPrincipalId: string | null;
+  agentName?: string | null;
   runId: string | null;
   method: string | null;
   action: string;
@@ -52,6 +58,36 @@ export interface Audit {
   scope: string | null;
   decision: "allow" | "deny";
   reason: string;
+  /** Operation-level risk assessment (Phase 1 enhancement). */
+  operationRiskLevel?: "low" | "medium" | "high";
+  operationRiskScore?: number; // 0-100
+  operationRiskFactors?: string[];
+  /** Workflow hierarchy tracking (Phase 1 enhancement). */
+  nodeId?: string;
+  parentNodeId?: string;
+}
+
+export interface AgentProgressEvent {
+  id: string;
+  type: string;
+  label: string;
+  summary: string;
+  detail?: string;
+  timestamp: string;
+}
+
+export type RiskLevel = "low" | "medium" | "high";
+
+export interface WorkflowNode {
+  id: string;
+  type: "orchestrator" | "agent" | "task";
+  parentId?: string;
+  runId: string;
+  agentId?: string;
+  status: "queued" | "running" | "completed" | "failed" | "pending_approval";
+  riskLevel: RiskLevel;
+  createdAt: string;
+  completedAt?: string;
 }
 
 export interface SystemInfo {
@@ -64,4 +100,31 @@ export interface SystemInfo {
   containerEngine: string | null;
   runtime: string;
   mockResourcePort?: number;
+}
+
+export interface IntentPlan {
+  intent: string;
+  requestedScopes: string[];
+  baselineScopes: string[];
+  elevatedScopes: string[];
+  unknownScopes: string[];
+  justification: string;
+  source: "llm" | "fallback";
+}
+
+/** A redacted view of a centralized stored secret — the value never leaves
+ *  the server. Secrets are global (not user-owned). */
+export interface Secret {
+  key: string;
+  redactedView: string;
+}
+
+export interface User {
+  id: string;
+  userId: string;
+  role: "admin" | "user";
+  /** Inherent (human-principal) permissions an admin grants; the baseline
+   *  authority a user can exercise or delegate to their agents. */
+  scopes: string[];
+  createdAt: string;
 }

@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "./config.js";
+import { loadConfig } from "../config.js";
 import {
   buildContainerRunArgs,
   containerName,
-} from "./container-codex-runner.js";
+} from "../container-codex-runner.js";
 
 describe("Container Codex runner", () => {
   it("builds an isolated Docker/Podman-compatible invocation", () => {
@@ -31,6 +31,7 @@ describe("Container Codex runner", () => {
     expect(containerName("agent/unsafe", "test-instance")).toBe(
       "launchpad-test-instance-agent-unsafe",
     );
+    console.log(args);
     expect(args).toContain("runtime:test");
     expect(args).toContain("type=bind,src=/tmp/agent-workspace,dst=/workspace");
     expect(args).toContain("type=bind,src=/tmp/codex-home,dst=/codex-home");

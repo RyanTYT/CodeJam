@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken, setMockUser } from "./api";
-import type { Agent, AgentRun, Audit, Message, SystemInfo } from "./types";
+import type { Agent, AgentRun, Audit, IntentPlan, Message, Secret, SystemInfo, User, WorkflowNode } from "./types";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
   "Inspect this workspace and explain what you would improve first.",
   "Build a responsive single-page todo app with tests.",
 ];
+
+const SHOW_DEMO_LOGS = true;
 
 const emptyForm = {
   name: "",
@@ -15,11 +17,289 @@ const emptyForm = {
     "Help me build and test software in this workspace. Keep changes small and explain the result.",
 };
 
+const POLICY_TABS = ["permissions", "vault", "owner"] as const;
+type PolicyTab = (typeof POLICY_TABS)[number];
+type ActivityRiskLevel = "low" | "medium" | "high" | "observed";
+type ActivitySource = "access" | "lifecycle" | "workflow" | "runtime" | "response";
+type ActivityLog = {
+  id: string;
+  timestamp: string;
+  agentId: string | null;
+  agentName: string;
+  agentPrincipalId: string | null;
+  runId: string | null;
+  userId: string;
+  summary: string;
+  action: string;
+  source: ActivitySource;
+  resource: string;
+  scope: string | null;
+  method: string | null;
+  riskLevel: ActivityRiskLevel;
+  riskScore: number | null;
+  riskFactors: string[];
+  decision: "allow" | "deny" | "info";
+  detail: string;
+  status?: string;
+  runStatus?: AgentRun["status"];
+};
+
+type ActivityRunGroup = {
+  id: string;
+  runId: string | null;
+  label: string;
+  prompt: string | null;
+  status: string | null;
+  allowCount: number;
+  denyCount: number;
+  logs: ActivityLog[];
+  latestTimestamp: string;
+};
+
+function formatRiskLabel(value: ActivityRiskLevel): string {
+  return value;
+}
+
+function activitySourceLabel(source: ActivitySource): string {
+  if (source === "access") return "Protected access";
+  if (source === "lifecycle") return "Agent management";
+  if (source === "workflow") return "Run status";
+  if (source === "response") return "Response delivered";
+  return "Agent work";
+}
+
+function activityStatusLabel(log: ActivityLog): string {
+  if (log.source === "response") return "Completed";
+  if (log.source === "workflow") {
+    if (log.status === "running") return "In progress";
+    if (log.status === "failed") return "Failed";
+    return "Completed";
+  }
+  if (log.source === "runtime" && log.resource === "error") {
+    return log.runStatus === "completed" ? "Recovered" : "Warning";
+  }
+  return "Observed";
+}
+
+function permissionDescription(log: ActivityLog): string {
+  if (log.scope?.startsWith("read:secrets:")) return "Read this protected configuration";
+  if (log.scope?.startsWith("write:secrets:")) return "Update this protected configuration";
+  if (log.scope === "act:deploy:dev") return "Deploy to the development environment";
+  if (log.scope === "act:deploy:prod") return "Deploy to the production environment";
+  return log.scope ?? "—";
+}
+
+function authorizationReason(log: ActivityLog): string {
+  if (log.detail === "owner") {
+    return `${log.userId} owns this Agent and is allowed to manage it.`;
+  }
+  if (log.detail === "scope match") {
+    return "The Agent has the approved permission needed for this resource.";
+  }
+  if (log.detail === "capability not granted") {
+    return "This Agent was not given the permission required for this action.";
+  }
+  if (log.detail === "not owner") {
+    return "The signed-in user does not own this Agent.";
+  }
+  if (log.detail === "invalid or revoked token") {
+    return "The Agent credential is no longer valid.";
+  }
+  if (log.detail === "missing token") {
+    return "The request did not include an Agent credential.";
+  }
+  return log.detail;
+}
+
+function activityPreview(log: ActivityLog): string {
+  if (log.source === "access" || log.source === "lifecycle") {
+    return authorizationReason(log);
+  }
+  if (log.source === "runtime" && log.resource === "error") {
+    return activitySummary(log);
+  }
+  return log.source === "response" ? log.summary : log.detail;
+}
+
+function activitySummary(log: ActivityLog): string {
+  if (log.source === "lifecycle" && log.action === "send") {
+    return `${log.userId} started a new run for ${log.agentName}.`;
+  }
+  if (log.source === "access") {
+    const outcome = log.decision === "allow" ? "allowed" : "blocked";
+    return `The Agent requested ${describeProtectedResource(log.resource)}. IAM ${outcome} the request.`;
+  }
+  if (log.source === "runtime" && log.resource === "error") {
+    return log.runStatus === "completed"
+      ? "The runtime reported an issue, but the Agent completed this request."
+      : "The runtime reported an issue while the Agent was handling this request.";
+  }
+  return log.summary;
+}
+
+function decisionOutcomeLabel(log: ActivityLog): string {
+  if (log.source === "lifecycle") return log.decision === "allow" ? "Passed" : "Blocked";
+  return log.decision === "allow" ? "Allowed" : "Blocked";
+}
+
+function activityOutcomeLabel(log: ActivityLog): string {
+  if (log.source === "access") return decisionOutcomeLabel(log);
+  if (log.source === "lifecycle") return log.decision === "allow" ? "Ownership confirmed" : "Ownership blocked";
+  if (log.source === "response") return "Completed";
+  if (log.source === "runtime" && log.resource === "error") {
+    return log.runStatus === "completed" ? "Recovered" : "Runtime warning";
+  }
+  if (log.source === "workflow") return activityStatusLabel(log);
+  return "Observed";
+}
+
+function activityOutcomeClass(log: ActivityLog): string {
+  if (log.source === "access") return log.decision === "allow" ? "outcome-allowed" : "outcome-blocked";
+  if (log.source === "runtime" && log.resource === "error") {
+    return log.runStatus === "completed" ? "outcome-recovered" : "outcome-warning";
+  }
+  if (log.source === "response") return "outcome-completed";
+  return "outcome-observed";
+}
+
+function runtimeWarningExplanation(log: ActivityLog): string {
+  return log.runStatus === "completed"
+    ? "Codex reported a tool issue, but later steps completed and the Agent returned a response. Check the command and protected-access events in this run for the final outcome."
+    : "Codex reported a tool issue while handling this request. Review the command events and run status for more detail.";
+}
+
+function commandFromDetail(detail: string): string | null {
+  const match = /^Command:\s*([\s\S]*?)(?:\nOutput:|$)/.exec(detail);
+  return match?.[1]?.trim() || null;
+}
+
+function outputFromCommandDetail(detail: string): string | null {
+  const match = /\nOutput:\s*([\s\S]*)$/.exec(detail);
+  return match?.[1]?.trim() || null;
+}
+
+function shortenPrompt(prompt: string): string {
+  const compact = prompt.replace(/\s+/g, " ").trim();
+  return compact.length > 100 ? compact.slice(0, 100) + "…" : compact;
+}
+
+function describeProtectedResource(resource: string): string {
+  if (resource.startsWith("secrets:")) {
+    return `the ${resource.slice("secrets:".length)} protected configuration`;
+  }
+  if (resource.startsWith("deploy:")) {
+    return `the ${resource.slice("deploy:".length)} deployment`;
+  }
+  return resource;
+}
+
+function activityActionLabel(log: ActivityLog): string {
+  if (log.source === "access") {
+    const outcome = log.decision === "allow" ? "allowed" : "blocked";
+    if (log.action === "read") return `Protected configuration access ${outcome}`;
+    if (log.action === "write") return `Protected data update ${outcome}`;
+    if (log.action === "act") return `Protected action ${outcome}`;
+    return `Protected resource request ${outcome}`;
+  }
+  if (log.source === "lifecycle") {
+    if (log.action === "send") return "User started this Agent run";
+    if (log.action === "create") return "Agent created";
+    if (log.action === "revoke") return "Agent credential revoked";
+    if (log.action === "revoke-scope") return "Agent permission revoked";
+    if (log.action === "start") return "Agent started";
+    if (log.action === "stop") return "Agent stopped";
+    return "Agent lifecycle updated";
+  }
+  if (log.source === "workflow") {
+    if (log.resource === "orchestrator") return log.status === "completed" ? "Run completed" : "Run started";
+    return log.status === "completed" ? "Agent task completed" : "Agent task running";
+  }
+  if (log.source === "response") return "Agent returned a response";
+  if (log.resource === "error") return "Runtime warning";
+  if (log.action === "Reasoning") return "Agent planned the next step";
+  if (log.action === "Command") return "Agent ran a workspace command";
+  if (log.action === "File edit") return "Agent updated a file";
+  if (log.action === "File search") return "Agent searched the workspace";
+  if (log.action === "Validation") return "Agent validated its work";
+  return "Agent runtime activity";
+}
+
+function groupOutcomeSummary(group: ActivityRunGroup): string {
+  const denied = group.logs.find((log) => log.source === "access" && log.decision === "deny");
+  if (denied) {
+    return `The Agent requested ${describeProtectedResource(denied.resource)}. IAM blocked it because the required permission was not granted.`;
+  }
+  const allowed = group.logs.find((log) => log.source === "access" && log.decision === "allow");
+  if (allowed) {
+    return `IAM allowed the Agent to access ${describeProtectedResource(allowed.resource)} with its approved permission.`;
+  }
+  if (group.status === "completed") return "The Agent completed this user request without protected-resource access.";
+  if (group.status === "failed") return "The Agent could not complete this user request.";
+  return "This contains Agent setup and lifecycle activity.";
+}
+
 function formatTime(value: string): string {
   return new Intl.DateTimeFormat(undefined, {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
+}
+
+function formatDateTime(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
+}
+
+/**
+ * Client-side mirror of the server's scope taxonomy for centralized secrets:
+ * any `read:secrets:<key>` is baseline, any write is elevated, deploy dev is
+ * baseline, prod elevated. No own/cross-user axis (secrets are global).
+ */
+function classifyScopeClient(scope: string): "baseline" | "elevated" | "unknown" {
+  if (/^read:secrets:.+/.test(scope)) return "baseline";
+  if (/^write:secrets:.+/.test(scope)) return "elevated";
+  if (scope === "act:deploy:dev") return "baseline";
+  if (scope === "act:deploy:prod") return "elevated";
+  return "unknown";
+}
+
+/**
+ * Mirror of the relay's capability check: a granted scope `granted` covers a
+ * cell scope `cell` when they are equal, OR `cell` starts with `granted + "/"`
+ * (so an owner-scoped grant covers every per-key cell under that owner).
+ */
+function scopeCovers(granted: string, cell: string): boolean {
+  return cell === granted || cell.startsWith(granted + "/");
+}
+
+function isGranted(scopes: string[], cell: string): boolean {
+  return scopes.some((granted) => scopeCovers(granted, cell));
+}
+
+/** Does a user have access to a permission? Admins bypass; otherwise any
+ *  granted scope that covers the permission (exact or a coarser owner scope)
+ *  counts. */
+function userHasPermission(user: User, scope: string): boolean {
+  if (user.role === "admin") return true;
+  return user.scopes.some((granted) => scopeCovers(granted, scope));
+}
+
+type UserPermissionStatus =
+  | { kind: "admin" }
+  | { kind: "granted" }
+  | { kind: "via"; via: string }
+  | { kind: "none" };
+
+/** How a user holds a permission: admin bypass, exact grant, inherited via a
+ *  broader granted scope, or not at all. Drives the admin detail toggles. */
+function userPermissionStatus(user: User, scope: string): UserPermissionStatus {
+  if (user.role === "admin") return { kind: "admin" };
+  if (user.scopes.includes(scope)) return { kind: "granted" };
+  const broader = user.scopes.find((granted) => granted !== scope && scopeCovers(granted, scope));
+  if (broader) return { kind: "via", via: broader };
+  return { kind: "none" };
 }
 
 function StatusPill({ status }: { status: Agent["status"] }) {
@@ -45,22 +325,364 @@ export default function App() {
   const [form, setForm] = useState(emptyForm);
   const [prompt, setPrompt] = useState("");
   const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
+  const [runs, setRuns] = useState<AgentRun[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [authRequired, setAuthRequired] = useState<boolean | null>(null);
   const [authInput, setAuthInput] = useState("");
   const [currentUser, setCurrentUser] = useState("default");
   const [audit, setAudit] = useState<Audit[]>([]);
+  const [workflow, setWorkflow] = useState<WorkflowNode[]>([]);
+  const [activeTab, setActiveTab] = useState<"chat" | "logs">("chat");
+  const [intent, setIntent] = useState("");
+  const [plan, setPlan] = useState<IntentPlan | null>(null);
+  /** Scopes the owner has picked for the new agent. Pre-filled by the plan
+   *  (its baseline + elevated), but the owner can toggle ANY catalog scope. */
+  const [createScopes, setCreateScopes] = useState<Set<string>>(new Set());
+  const [auditFilter, setAuditFilter] = useState<"all" | "allow" | "deny">("all");
+  const [expandedAuditId, setExpandedAuditId] = useState<string | null>(null);
+  const [policyTab, setPolicyTab] = useState<PolicyTab>("permissions");
+  const [secrets, setSecrets] = useState<Secret[]>([]);
+  const [selectedForRevoke, setSelectedForRevoke] = useState<Set<string>>(new Set());
+  const [vaultForm, setVaultForm] = useState({
+    key: "",
+    value: "",
+    redactedView: "",
+  });
+  const [showVaultForm, setShowVaultForm] = useState(false);
+  const [editingSecretKey, setEditingSecretKey] = useState<string | null>(null);
+  const [users, setUsers] = useState<User[]>([]);
+  const [showAddUser, setShowAddUser] = useState(false);
+  const [newUserForm, setNewUserForm] = useState<{ userId: string; role: "user" | "admin" }>({
+    userId: "",
+    role: "user",
+  });
+  const [addUserStep, setAddUserStep] = useState<1 | 2>(1);
+  const [newUserScopes, setNewUserScopes] = useState<Set<string>>(new Set());
+  const [showAdmin, setShowAdmin] = useState(false);
+  const [adminPerm, setAdminPerm] = useState<string | null>(null);
+  const [selectedWorkflowNodeId, setSelectedWorkflowNodeId] = useState<string | null>(null);
+  const [selectedLogId, setSelectedLogId] = useState<string | null>(null);
+  const [logCopied, setLogCopied] = useState(false);
+  const [expandedRunGroupIds, setExpandedRunGroupIds] = useState<Set<string>>(new Set());
   const messageEnd = useRef<HTMLDivElement>(null);
   const selectedIdRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
   const pollingRunIds = useRef(new Set<string>());
   selectedIdRef.current = selectedId;
+  const currentRole: "admin" | "user" =
+    users.find((u) => u.userId === currentUser)?.role ?? "user";
+
+  const myScopes: string[] =
+    users.find((u) => u.userId === currentUser)?.scopes ?? [];
 
   const selected = useMemo(
     () => agents.find((agent) => agent.id === selectedId) ?? null,
     [agents, selectedId],
   );
+
+  const workflowByParent = useMemo(() => {
+    const next = new Map<string | undefined, WorkflowNode[]>();
+    for (const node of workflow) {
+      const key = node.parentId ?? "root";
+      const existing = next.get(key) ?? [];
+      existing.push(node);
+      next.set(key, existing);
+    }
+    return next;
+  }, [workflow]);
+
+  const ownerRole: "admin" | "user" = selected
+    ? (users.find((u) => u.userId === selected.ownerId)?.role ?? "user")
+    : "user";
+
+  /** The full permission catalog for the admin panel + add-user wizard: every
+   *  per-key read/write for each centralized secret, plus the deploy scopes.
+   *  `riskMap` looks up a scope's inherent risk (read = baseline, write/prod =
+   *  elevated) for the detail view. */
+  const catalog = useMemo(() => {
+    const secretEntries: { scope: string; risk: "baseline" | "elevated" }[] = [];
+    const riskMap = new Map<string, "baseline" | "elevated">();
+    for (const s of secrets) {
+      const readScope = "read:secrets:" + s.key;
+      const writeScope = "write:secrets:" + s.key;
+      secretEntries.push({ scope: readScope, risk: "baseline" });
+      secretEntries.push({ scope: writeScope, risk: "elevated" });
+      riskMap.set(readScope, "baseline");
+      riskMap.set(writeScope, "elevated");
+    }
+    const deployEntries = [
+      { scope: "act:deploy:dev", risk: "baseline" as const },
+      { scope: "act:deploy:prod", risk: "elevated" as const },
+    ];
+    for (const e of deployEntries) riskMap.set(e.scope, e.risk);
+    const groups: {
+      label: string;
+      entries: { scope: string; risk: "baseline" | "elevated" }[];
+    }[] = [
+      { label: "Secrets", entries: secretEntries },
+      { label: "Deploy", entries: deployEntries },
+    ];
+    return { groups, riskMap };
+  }, [secrets]);
+
+  const runProgress = useMemo(() => {
+    const seen = new Set<string>();
+    return (activeRun?.progress ?? []).filter((event) => {
+      if (seen.has(event.id)) return false;
+      seen.add(event.id);
+      return true;
+    });
+  }, [activeRun]);
+
+  const loggedRunProgress = useMemo(() => {
+    const seen = new Set<string>();
+    return runs.flatMap((run) =>
+      (run.progress ?? []).map((event) => ({
+        ...event,
+        id: `${run.id}:${event.id}`,
+        runId: run.id,
+        output: run.output,
+        runStatus: run.status,
+      })),
+    ).filter((event) => {
+      if (seen.has(event.id)) return false;
+      seen.add(event.id);
+      return true;
+    });
+  }, [runs]);
+
+  const agentLogs = useMemo(() => {
+    const items: ActivityLog[] = [];
+
+    const auditRows: Audit[] =
+      audit.length > 0 || !selected || !SHOW_DEMO_LOGS
+        ? audit
+        : [
+            {
+              id: "demo-low",
+              timestamp: new Date(Date.now() - 2 * 60_000).toISOString(),
+              humanPrincipalId: "user:" + (selected.ownerId ?? "demo-user"),
+              agentId: selected.id,
+              agentPrincipalId: null,
+              runId: null,
+              method: "GET",
+              action: "Read resource",
+              resource: "secrets:dev-db-url",
+              scope: "read:secrets:dev-db-url",
+              decision: "allow" as const,
+              reason: "capability granted",
+              operationRiskLevel: "low" as const,
+            },
+            {
+              id: "demo-medium",
+              timestamp: new Date(Date.now() - 90_000).toISOString(),
+              humanPrincipalId: "user:" + (selected.ownerId ?? "demo-user"),
+              agentId: selected.id,
+              agentPrincipalId: null,
+              runId: null,
+              method: "POST",
+              action: "Deploy change",
+              resource: "deploy:dev",
+              scope: "act:deploy:dev",
+              decision: "allow" as const,
+              reason: "elevated action approved",
+              operationRiskLevel: "medium" as const,
+            },
+            {
+              id: "demo-high",
+              timestamp: new Date(Date.now() - 30_000).toISOString(),
+              humanPrincipalId: "user:" + (selected.ownerId ?? "demo-user"),
+              agentId: selected.id,
+              agentPrincipalId: null,
+              runId: null,
+              method: "POST",
+              action: "Deploy change",
+              resource: "deploy:prod",
+              scope: "act:deploy:prod",
+              decision: "deny" as const,
+              reason: "capability not granted",
+              operationRiskLevel: "high" as const,
+            },
+          ];
+
+    for (const row of auditRows) {
+      const source: ActivitySource = ["read", "write", "act", "unknown"].includes(row.action)
+        ? "access"
+        : "lifecycle";
+      items.push({
+        id: row.id,
+        timestamp: row.timestamp,
+        agentId: row.agentId ?? selected?.id ?? null,
+        agentName: row.agentName ?? agents.find((agent) => agent.id === row.agentId)?.name ?? (row.agentId ? "Agent name unavailable" : "No Agent associated"),
+        agentPrincipalId: row.agentPrincipalId,
+        runId: row.runId,
+        userId: row.humanPrincipalId.replace(/^user:/, ""),
+        summary: `${row.action} on ${row.resource}`,
+        action: row.action,
+        source,
+        resource: row.resource,
+        scope: row.scope,
+        method: row.method,
+        riskLevel: source === "access"
+          ? row.operationRiskLevel ?? (row.decision === "deny" ? "high" : "low")
+          : "observed",
+        riskScore: source === "access" ? row.operationRiskScore ?? null : null,
+        riskFactors: source === "access" ? row.operationRiskFactors ?? [] : [],
+        decision: row.decision,
+        detail: row.reason || row.resource,
+      });
+    }
+
+    for (const node of workflow) {
+      items.push({
+        id: node.id,
+        timestamp: node.createdAt,
+        agentId: node.agentId ?? selected?.id ?? null,
+        agentName: agents.find((agent) => agent.id === node.agentId)?.name ?? selected?.name ?? "Agent",
+        agentPrincipalId: null,
+        runId: node.runId,
+        userId: "—",
+        summary: `${node.status} · ${node.type}`,
+        action: node.type === "agent" ? "Agent node" : node.type === "task" ? "Task execution" : "Workflow orchestration",
+        source: "workflow",
+        resource: node.type,
+        scope: null,
+        method: null,
+        riskLevel: "observed",
+        riskScore: null,
+        riskFactors: [],
+        decision: "info",
+        detail: `${node.status} · ${node.type}`,
+        status: node.status,
+      });
+    }
+
+    for (const item of loggedRunProgress) {
+      items.push({
+        id: item.id,
+        timestamp: item.timestamp,
+        agentId: selected?.id ?? null,
+        agentName: selected?.name ?? "Agent",
+        agentPrincipalId: null,
+        runId: item.runId,
+        userId: "—",
+        summary: item.summary || "Progress event",
+        action: item.label,
+        source: item.type === "response_ready" ? "response" : "runtime",
+        resource: item.type,
+        scope: null,
+        method: null,
+        riskLevel: "observed",
+        riskScore: null,
+        riskFactors: [],
+        decision: "info",
+        detail: item.type === "response_ready"
+          ? item.output ?? "Codex response is unavailable."
+          : item.detail ?? (item.summary || "Progress event"),
+        runStatus: item.runStatus,
+      });
+    }
+
+    return items.sort(
+      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+    );
+  }, [agents, audit, loggedRunProgress, selected, workflow]);
+
+  const selectedWorkflowNode = useMemo(
+    () => workflow.find((node) => node.id === selectedWorkflowNodeId) ?? workflow[0] ?? null,
+    [selectedWorkflowNodeId, workflow],
+  );
+
+  const selectedLog = useMemo(
+    () => agentLogs.find((log) => log.id === selectedLogId) ?? agentLogs[0] ?? null,
+    [agentLogs, selectedLogId],
+  );
+
+  const activityRunGroups = useMemo((): ActivityRunGroup[] => {
+    const userMessages = messages
+      .filter((message) => message.role === "user")
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    const messageByRunId = new Map(userMessages.map((message, index) => [
+      message.runId,
+      { prompt: shortenPrompt(message.content), number: index + 1 },
+    ]));
+    const runById = new Map(runs.map((run) => [run.id, run]));
+    const groups = new Map<string, ActivityRunGroup>();
+
+    for (const log of agentLogs) {
+      const id = log.runId ?? "agent-setup";
+      const existing = groups.get(id);
+      if (existing) {
+        existing.logs.push(log);
+        if (log.timestamp > existing.latestTimestamp) existing.latestTimestamp = log.timestamp;
+        if (log.source === "access" && log.decision === "allow") existing.allowCount += 1;
+        if (log.source === "access" && log.decision === "deny") existing.denyCount += 1;
+        continue;
+      }
+      const message = log.runId ? messageByRunId.get(log.runId) : undefined;
+      const run = log.runId ? runById.get(log.runId) : undefined;
+      groups.set(id, {
+        id,
+        runId: log.runId,
+        label: message ? `Message ${message.number}` : log.runId ? "Run activity" : "Agent setup",
+        prompt: message?.prompt ?? null,
+        status: run?.status ?? null,
+        allowCount: log.source === "access" && log.decision === "allow" ? 1 : 0,
+        denyCount: log.source === "access" && log.decision === "deny" ? 1 : 0,
+        logs: [log],
+        latestTimestamp: log.timestamp,
+      });
+    }
+
+    return [...groups.values()]
+      .map((group) => ({
+        ...group,
+        logs: [...group.logs].sort((left, right) => new Date(right.timestamp).getTime() - new Date(left.timestamp).getTime()),
+      }))
+      .sort((left, right) => new Date(right.latestTimestamp).getTime() - new Date(left.latestTimestamp).getTime());
+  }, [agentLogs, messages, runs]);
+
+  const toggleRunGroup = (groupId: string) => {
+    setExpandedRunGroupIds((current) => {
+      const next = new Set(current);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
+      return next;
+    });
+  };
+
+  const copyActivityLog = async () => {
+    const text = [
+      "Agent Launchpad activity log",
+      selected ? `Agent: ${selected.name}` : "Agent: all activity",
+      ...activityRunGroups.map((group) => [
+        `=== ${group.label} ===`,
+        group.prompt ? `User request: ${group.prompt}` : null,
+        group.runId ? `Run: ${group.runId}` : null,
+        group.status ? `Run status: ${group.status}` : null,
+        ...group.logs.map((log) => [
+          `[${formatDateTime(log.timestamp)}] ${activityActionLabel(log)}`,
+          `Type: ${activitySourceLabel(log.source)}`,
+          `Agent: ${log.agentName}`,
+          log.source === "access" ? `Resource: ${log.resource}` : null,
+          log.source === "access" ? `Required scope: ${log.scope ?? "—"}` : null,
+          log.source === "access" || log.source === "lifecycle"
+            ? `Decision: ${log.decision}`
+            : `Status: ${log.source === "response" ? "completed" : log.status ?? "recorded"}`,
+          `Risk: ${formatRiskLabel(log.riskLevel)}`,
+          `Detail: ${log.detail}`,
+        ].filter((line): line is string => line !== null).join("\n")),
+      ].filter((line): line is string => line !== null).join("\n\n")),
+    ].join("\n\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      setLogCopied(true);
+      window.setTimeout(() => setLogCopied(false), 2_000);
+    } catch {
+      setError("Could not copy the activity log. Check browser clipboard permissions.");
+    }
+  };
 
   const refreshAgents = useCallback(async () => {
     const { agents: next } = await api.listAgents();
@@ -79,9 +701,24 @@ export default function App() {
     }
   }, []);
 
+  const refreshSecrets = useCallback(async () => {
+    const { secrets: next } = await api.listSecrets();
+    if (mountedRef.current) setSecrets(next);
+  }, []);
+
+  const refreshUsers = useCallback(async () => {
+    const { users: next } = await api.listUsers();
+    if (mountedRef.current) setUsers(next);
+  }, []);
+
   const bootstrap = useCallback(async () => {
-    await Promise.all([refreshAgents(), api.system().then(setSystem)]);
-  }, [refreshAgents]);
+    await Promise.all([
+      refreshAgents(),
+      api.system().then(setSystem),
+      refreshUsers(),
+      refreshSecrets(),
+    ]);
+  }, [refreshAgents, refreshUsers, refreshSecrets]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -100,25 +737,46 @@ export default function App() {
 
   useEffect(() => {
     setMockUser(currentUser);
-    void refreshAgents().catch((reason) =>
+    void Promise.all([refreshAgents(), refreshUsers(), refreshSecrets()]).catch((reason) =>
       setError(reason instanceof Error ? reason.message : String(reason)),
     );
-  }, [currentUser, refreshAgents]);
+  }, [currentUser, refreshAgents, refreshUsers, refreshSecrets]);
 
   useEffect(() => {
     setActiveRun(null);
     setShowSettings(false);
+    setShowVaultForm(false);
     setAudit([]);
+    setRuns([]);
+    setWorkflow([]);
+    setExpandedRunGroupIds(new Set());
+    setSelectedForRevoke(new Set());
     if (!selectedId) {
       setMessages([]);
       return;
     }
-    void Promise.all([refreshMessages(selectedId), api.runs(selectedId), api.audit(selectedId)])
-      .then(([, runsResult, auditResult]) => {
+    void Promise.all([
+      refreshMessages(selectedId),
+      api.runs(selectedId),
+      api.audit(selectedId),
+      refreshSecrets(),
+    ])
+      .then(async ([, runsResult, auditResult]) => {
         if (selectedIdRef.current !== selectedId) return;
         setAudit(auditResult.audit);
+        setRuns(runsResult.runs);
         const latest = runsResult.runs[0] ?? null;
         setActiveRun(latest);
+        if (latest) {
+          try {
+            const workflowResult = await api.workflow(latest.id);
+            if (selectedIdRef.current === selectedId) {
+              setWorkflow(workflowResult.workflow);
+            }
+          } catch (reason) {
+            setError(reason instanceof Error ? reason.message : String(reason));
+          }
+        }
         if (latest && ["queued", "running"].includes(latest.status)) {
           void pollRun(latest.id, selectedId).catch((reason) =>
             setError(reason instanceof Error ? reason.message : String(reason)),
@@ -128,7 +786,20 @@ export default function App() {
       .catch((reason) =>
         setError(reason instanceof Error ? reason.message : String(reason)),
       );
-  }, [refreshMessages, selectedId]);
+  }, [refreshMessages, selectedId, refreshSecrets]);
+
+  useEffect(() => {
+    if (currentRole !== "admin") return;
+    setAudit([]);
+    const refreshAudit = () => api.audit()
+      .then((result) => {
+        if (mountedRef.current && currentRole === "admin") setAudit(result.audit);
+      })
+      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+    void refreshAudit();
+    const interval = window.setInterval(() => void refreshAudit(), 900);
+    return () => window.clearInterval(interval);
+  }, [currentRole]);
 
   useEffect(() => {
     if (selected) {
@@ -139,6 +810,17 @@ export default function App() {
       });
     }
   }, [selected]);
+
+  useEffect(() => {
+    if (agentLogs.length === 0) {
+      setSelectedLogId(null);
+      return;
+    }
+
+    if (!selectedLogId || !agentLogs.some((log) => log.id === selectedLogId)) {
+      setSelectedLogId(agentLogs[0].id);
+    }
+  }, [agentLogs, selectedLogId]);
 
   useEffect(() => {
     messageEnd.current?.scrollIntoView({ behavior: "smooth" });
@@ -154,6 +836,60 @@ export default function App() {
       setSelectedId(agent.id);
       setShowCreate(false);
       setForm(emptyForm);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const planIntent = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!intent.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const { plan: next } = await api.planAgent(intent.trim());
+      setPlan(next);
+      // Pre-fill the pickable set with the plan's suggested scopes (baseline +
+      // elevated). The owner can then toggle any catalog scope.
+      setCreateScopes(new Set([...next.baselineScopes, ...next.elevatedScopes]));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleCreateScope = (scope: string) => {
+    setCreateScopes((prev) => {
+      const next = new Set(prev);
+      if (next.has(scope)) next.delete(scope);
+      else next.add(scope);
+      return next;
+    });
+  };
+
+  const approveAndCreate = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!plan || !form.name.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const scopes = [...createScopes];
+      const { agent } = await api.createAgent({
+        name: form.name.trim(),
+        intent: intent.trim(),
+        scopes,
+        plan,
+      });
+      await refreshAgents();
+      setSelectedId(agent.id);
+      setShowCreate(false);
+      setForm(emptyForm);
+      setIntent("");
+      setPlan(null);
+      setCreateScopes(new Set());
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -227,6 +963,165 @@ export default function App() {
     }
   };
 
+  const revokeScope = async (scope: string) => {
+    if (!selected) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.removeScope(selected.id, scope);
+      await refreshAgents();
+      const result = await api.audit(selected.id);
+      if (selectedIdRef.current === selected.id) setAudit(result.audit);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleRevokeSelect = (scope: string) => {
+    setSelectedForRevoke((prev) => {
+      const next = new Set(prev);
+      if (next.has(scope)) next.delete(scope);
+      else next.add(scope);
+      return next;
+    });
+  };
+
+  const revokeSelected = async () => {
+    if (!selected || selectedForRevoke.size === 0) return;
+    setBusy(true);
+    setError(null);
+    try {
+      for (const scope of selectedForRevoke) {
+        await api.removeScope(selected.id, scope);
+      }
+      await refreshAgents();
+      const result = await api.audit(selected.id);
+      if (selectedIdRef.current === selected.id) setAudit(result.audit);
+      setSelectedForRevoke(new Set());
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const addSecret = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (currentRole !== "admin") {
+      setError("Only admins may manage secrets.");
+      return;
+    }
+    const { key, value, redactedView } = vaultForm;
+    if (!key.trim() || !value) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.addSecret(key.trim(), value, redactedView.trim() || undefined);
+      await refreshSecrets();
+      setVaultForm({ key: "", value: "", redactedView: "" });
+      setEditingSecretKey(null);
+      setShowVaultForm(false);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const editSecret = (key: string) => {
+    setEditingSecretKey(key);
+    setVaultForm({ key, value: "", redactedView: "" });
+    setShowVaultForm(false);
+  };
+
+  const cancelEditSecret = () => {
+    setEditingSecretKey(null);
+    setVaultForm({ key: "", value: "", redactedView: "" });
+  };
+
+  const revokeSecret = async (key: string) => {
+    if (currentRole !== "admin") {
+      setError("Only admins may manage secrets.");
+      return;
+    }
+    if (!window.confirm("Revoke secret " + key + "?")) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.revokeSecret(key);
+      await refreshSecrets();
+      if (selected) {
+        const result = await api.audit(selected.id);
+        if (selectedIdRef.current === selected.id) setAudit(result.audit);
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleNewUserScope = (scope: string) => {
+    setNewUserScopes((prev) => {
+      const next = new Set(prev);
+      if (next.has(scope)) next.delete(scope);
+      else next.add(scope);
+      return next;
+    });
+  };
+
+  const submitAddUser = async () => {
+    if (currentRole !== "admin") {
+      setError("Only admins may add users.");
+      return;
+    }
+    if (!newUserForm.userId.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const userId = newUserForm.userId.trim();
+      await api.addUser(userId, newUserForm.role, [...newUserScopes]);
+      await refreshUsers();
+      setCurrentUser(userId);
+      setShowAddUser(false);
+      setAddUserStep(1);
+      setNewUserForm({ userId: "", role: "user" });
+      setNewUserScopes(new Set());
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const grantScopeToUser = async (userId: string, scope: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.grantUserScope(userId, scope);
+      await refreshUsers();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const revokeScopeFromUser = async (userId: string, scope: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.revokeUserScope(userId, scope);
+      await refreshUsers();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const pollRun = async (runId: string, agentId: string) => {
     if (pollingRunIds.current.has(runId)) return;
     pollingRunIds.current.add(runId);
@@ -235,14 +1130,21 @@ export default function App() {
         await new Promise((resolve) => window.setTimeout(resolve, 900));
         if (!mountedRef.current) return;
         const result = await api.run(runId);
-        if (selectedIdRef.current === agentId) setActiveRun(result.run);
+        const auditResult = await api.audit(agentId);
+        const workflowResult = await api.workflow(runId);
+        if (selectedIdRef.current === agentId) {
+          setActiveRun(result.run);
+          setRuns((current) => {
+            const existing = current.find((run) => run.id === result.run.id);
+            return existing
+              ? current.map((run) => run.id === result.run.id ? result.run : run)
+              : [result.run, ...current];
+          });
+          setAudit(auditResult.audit);
+          setWorkflow(workflowResult.workflow);
+        }
         if (!["queued", "running"].includes(result.run.status)) {
-          const [, , auditResult] = await Promise.all([
-            refreshMessages(agentId),
-            refreshAgents(),
-            api.audit(agentId),
-          ]);
-          if (selectedIdRef.current === agentId) setAudit(auditResult.audit);
+          await Promise.all([refreshMessages(agentId), refreshAgents()]);
           return;
         }
       }
@@ -262,6 +1164,7 @@ export default function App() {
       if (selectedIdRef.current === selected.id) {
         setMessages((current) => [...current, result.message]);
         setActiveRun(result.run);
+        setRuns((current) => [result.run, ...current.filter((run) => run.id !== result.run.id)]);
       }
       setAgents((current) =>
         current.map((agent) =>
@@ -294,6 +1197,46 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  };
+
+  /** A single permission-map cell: risk dot + verb label + (if granted) a
+   *  bulk-revoke checkbox and a single-scope revoke ×. Greyed when un-granted. */
+  const renderPermCell = (scope: string, label: string) => {
+    if (!selected) return null;
+    const granted = isGranted(selected.scopes ?? [], scope);
+    const risk = classifyScopeClient(scope);
+    const checked = selectedForRevoke.has(scope);
+    return (
+      <div key={scope} className={"perm-cell" + (granted ? " perm-granted" : "")}>
+        <span
+          className={"mini-dot mini-" + (risk === "baseline" ? "ready" : risk === "elevated" ? "warning" : "error")}
+        />
+        <code>{label}</code>
+        {granted ? (
+          <label className="perm-check">
+            <input
+              type="checkbox"
+              checked={checked}
+              onChange={() => toggleRevokeSelect(scope)}
+              disabled={busy}
+              title="Select for bulk revoke"
+            />
+          </label>
+        ) : (
+          <span className="perm-dash">—</span>
+        )}
+        {granted && (
+          <button
+            className="perm-x"
+            onClick={() => revokeScope(scope)}
+            disabled={busy}
+            title="Revoke this scope"
+          >
+            ×
+          </button>
+        )}
+      </div>
+    );
   };
 
   if (authRequired === null) {
@@ -337,8 +1280,16 @@ export default function App() {
     );
   }
 
+  const switcherUsers = users.length > 0 ? users.map((u) => u.userId) : ["default"];
+
   return (
-    <div className="app-shell">
+    <div
+      className={
+        "app-shell" +
+        (currentRole === "admin" ? " app-shell-admin" : "") +
+        (currentRole === "admin" && activeTab === "logs" ? " app-shell-wide" : "")
+      }
+    >
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">A</div>
@@ -353,24 +1304,112 @@ export default function App() {
         </div>
 
         <div className="user-switcher">
-          <span className="eyebrow">Mock user</span>
-          <select
-            value={currentUser}
-            onChange={(event) => {
-              setCurrentUser(event.target.value);
-              setSelectedId(null);
-            }}
-          >
-            <option value="default">default</option>
-            <option value="alice">alice</option>
-            <option value="bob">bob</option>
-          </select>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <span className="eyebrow">Mock user</span>
+            <span className="eyebrow" style={{ color: currentRole === "admin" ? "#b9a4ff" : undefined }}>
+              {currentRole}
+            </span>
+          </div>
+          <div className="segmented">
+            {switcherUsers.map((user) => (
+              <button
+                key={user}
+                type="button"
+                className={"segment" + (currentUser === user ? " segment-active" : "")}
+                onClick={() => {
+                  setCurrentUser(user);
+                  setSelectedId(null);
+                }}
+              >
+                {user}
+              </button>
+            ))}
+          </div>
+          {currentRole === "admin" ? (
+            <div style={{ display: "flex", gap: 6 }}>
+              <button
+                style={{
+                  flex: 1,
+                  minHeight: 32,
+                  fontSize: 11,
+                  border: "1px solid #3d3d38",
+                  background: "#292925",
+                  color: "#c9c8c1",
+                  borderRadius: 9,
+                  cursor: "pointer",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 6,
+                }}
+                onClick={() => {
+                  setAddUserStep(1);
+                  setNewUserScopes(new Set());
+                  setShowAddUser(true);
+                }}
+              >
+                <span>＋</span> Add user
+              </button>
+              <button
+                style={{
+                  flex: 1,
+                  minHeight: 32,
+                  fontSize: 11,
+                  border: "1px solid #3d3d38",
+                  background: "#292925",
+                  color: "#c9c8c1",
+                  borderRadius: 9,
+                  cursor: "pointer",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 6,
+                }}
+                onClick={() => {
+                  setAdminPerm(null);
+                  void refreshSecrets();
+                  void refreshUsers();
+                  setShowAdmin(true);
+                }}
+              >
+                <span>⚙</span> Permissions
+              </button>
+            </div>
+          ) : (
+            <button
+              style={{
+                width: "100%",
+                minHeight: 32,
+                fontSize: 11,
+                border: "1px solid #3d3d38",
+                background: "#292925",
+                color: "#c9c8c1",
+                borderRadius: 9,
+                cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 6,
+              }}
+              onClick={() => {
+                void refreshUsers();
+                setShowAdmin(true);
+              }}
+            >
+              <span>⚙</span> My permissions
+            </button>
+          )}
         </div>
 
+        {currentRole !== "admin" && (
+          <>
         <button
           className="button button-primary create-button"
           onClick={() => {
             setForm(emptyForm);
+            setIntent("");
+            setPlan(null);
+            setCreateScopes(new Set());
             setShowCreate(true);
           }}
         >
@@ -403,6 +1442,8 @@ export default function App() {
             </div>
           )}
         </nav>
+          </>
+        )}
 
         <div className="runtime-card">
           <span className="eyebrow">Runtime</span>
@@ -414,8 +1455,8 @@ export default function App() {
         </div>
       </aside>
 
-      <main className="main">
-        {!system?.arkConfigured || !system?.codexAvailable ? (
+      <main className={"main" + (selected && currentRole !== "admin" ? " main-agent-workspace" : "")}>
+        {currentRole !== "admin" && (!system?.arkConfigured || !system?.codexAvailable) ? (
           <div className="config-banner">
             <span>!</span>
             <div>
@@ -438,7 +1479,167 @@ export default function App() {
           </div>
         )}
 
-        {selected ? (
+        {currentRole === "admin" && (
+          <div className="agent-view-toggle admin-view-toggle" role="tablist" aria-label="Agent views">
+            <button
+              type="button"
+              className={"tab-button " + (activeTab === "chat" ? "tab-active" : "")}
+              onClick={() => setActiveTab("chat")}
+            >
+              Secrets
+            </button>
+            <button
+              type="button"
+              className={"tab-button " + (activeTab === "logs" ? "tab-active" : "")}
+              onClick={() => setActiveTab("logs")}
+            >
+              Logs
+            </button>
+          </div>
+        )}
+
+        {currentRole === "admin" && activeTab === "chat" ? (
+          <section className="secrets-panel">
+            <div className="secrets-head">
+              <div>
+                <span className="eyebrow">Secrets management</span>
+                <h1>Centralized secrets</h1>
+              </div>
+              <span className="eyebrow">{secrets.length}</span>
+            </div>
+            <p className="owner-note" style={{ margin: "0 0 14px" }}>
+              Add, update, or delete the centralized secrets that users and agents access.
+              Values are encrypted at rest; only the redacted label is ever returned.
+            </p>
+            <form className="vault-form" onSubmit={addSecret}>
+              <div className="secrets-form-row">
+                <label>
+                  Key
+                  <input
+                    value={vaultForm.key}
+                    onChange={(event) => setVaultForm({ ...vaultForm, key: event.target.value })}
+                    readOnly={!!editingSecretKey}
+                    required
+                    maxLength={120}
+                    placeholder="dev-db-url"
+                  />
+                </label>
+                <label>
+                  Redacted label (optional)
+                  <input
+                    value={vaultForm.redactedView}
+                    onChange={(event) =>
+                      setVaultForm({ ...vaultForm, redactedView: event.target.value })
+                    }
+                    maxLength={200}
+                    placeholder="postgres://***:***@db/agentdb"
+                  />
+                </label>
+              </div>
+              <label>
+                Value
+                <textarea
+                  value={vaultForm.value}
+                  onChange={(event) => setVaultForm({ ...vaultForm, value: event.target.value })}
+                  rows={2}
+                  required
+                  placeholder={
+                    editingSecretKey
+                      ? "Enter a new value to update this secret"
+                      : "the raw secret value — encrypted at rest"
+                  }
+                />
+              </label>
+              <div className="modal-footer" style={{ marginTop: 4 }}>
+                {editingSecretKey && (
+                  <button type="button" className="button button-ghost" onClick={cancelEditSecret}>
+                    Cancel
+                  </button>
+                )}
+                <button
+                  className="button button-primary"
+                  disabled={busy || !vaultForm.key.trim() || !vaultForm.value}
+                >
+                  {busy ? <Spinner /> : editingSecretKey ? "Update secret" : "Add secret"}
+                </button>
+              </div>
+            </form>
+            <div className="vault-grid">
+              {secrets.map((s) => (
+                <div className="vault-card" key={s.key}>
+                  <div className="vault-card-head">
+                    <code className="vault-key">{s.key}</code>
+                    <div className="secrets-card-actions">
+                      <button
+                        className="button button-ghost"
+                        style={{ minHeight: 28, fontSize: 10, padding: "0 8px" }}
+                        onClick={() => editSecret(s.key)}
+                        disabled={busy}
+                      >
+                        Edit
+                      </button>
+                      <button
+                        className="perm-x"
+                        onClick={() => revokeSecret(s.key)}
+                        disabled={busy}
+                        title="Delete secret"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  </div>
+                  <div className="vault-redacted">{s.redactedView}</div>
+                </div>
+              ))}
+              {secrets.length === 0 && <div className="perm-empty">No secrets yet.</div>}
+            </div>
+          </section>
+        ) : currentRole === "admin" && activeTab === "logs" ? (
+          <section className="admin-log-stream playground-logs">
+            <div className="logs-header-row">
+              <div>
+                <span className="eyebrow">Agent log stream</span>
+                <h2>All agent activity</h2>
+              </div>
+              <span className="logs-count">{agentLogs.length} events</span>
+            </div>
+            <div className="audit-filter-row">
+              {(["all", "allow", "deny"] as const).map((filter) => (
+                <button
+                  key={filter}
+                  type="button"
+                  className={"audit-filter" + (auditFilter === filter ? " audit-filter-active" : "")}
+                  onClick={() => setAuditFilter(filter)}
+                >
+                  {filter}
+                </button>
+              ))}
+            </div>
+            <div className="admin-log-list">
+              {agentLogs
+                .filter((log) => auditFilter === "all" || log.decision === auditFilter)
+                .map((log) => (
+                  <button
+                    key={log.id}
+                    type="button"
+                    className={"log-list-item risk-row-" + log.riskLevel + (selectedLog?.id === log.id ? " log-list-item-selected" : "")}
+                    onClick={() => setSelectedLogId(log.id)}
+                  >
+                    <div className="log-list-top">
+                      <span className={"risk-badge risk-" + log.riskLevel}>{formatRiskLabel(log.riskLevel)}</span>
+                      <span className="log-list-time">{formatTime(log.timestamp)}</span>
+                    </div>
+                    <strong>{activityActionLabel(log)}</strong>
+                    <span>{log.userId} · {log.agentName} · {log.resource}</span>
+                    <small>{log.source === "response" ? log.summary : log.detail}</small>
+                  </button>
+                ))}
+              {agentLogs.filter((log) => auditFilter === "all" || log.decision === auditFilter).length === 0 && (
+                <div className="empty-log-state">No matching logs.</div>
+              )}
+            </div>
+          </section>
+        ) : selected ? (
           <>
             <header className="agent-header">
               <div>
@@ -464,13 +1665,6 @@ export default function App() {
                   {selected.status === "stopped" ? "Start" : "Stop"}
                 </button>
                 <button
-                  className="button button-ghost"
-                  onClick={revokeCredential}
-                  disabled={busy || selected.status === "busy"}
-                >
-                  Revoke
-                </button>
-                <button
                   className="button button-danger"
                   onClick={deleteAgent}
                   disabled={busy || selected.status === "busy"}
@@ -479,6 +1673,23 @@ export default function App() {
                 </button>
               </div>
             </header>
+
+            <div className="agent-view-toggle" role="tablist" aria-label="Agent views">
+              <button
+                type="button"
+                className={"tab-button " + (activeTab === "chat" ? "tab-active" : "")}
+                onClick={() => setActiveTab("chat")}
+              >
+                Chat
+              </button>
+              <button
+                type="button"
+                className={"tab-button " + (activeTab === "logs" ? "tab-active" : "")}
+                onClick={() => setActiveTab("logs")}
+              >
+                Logs
+              </button>
+            </div>
 
             {showSettings && (
               <form className="settings-panel" onSubmit={saveAgent}>
@@ -530,71 +1741,285 @@ export default function App() {
               </form>
             )}
 
-            <section className="playground">
-              <div className="playground-topbar">
+            <section className={"playground " + (activeTab === "logs" ? "playground-logs user-log-container" : "")}>
+              <div className={"playground-topbar " + (activeTab === "logs" ? "logs-topbar-hidden" : "")}>
                 <div>
                   <span className="eyebrow">Playground</span>
                   <h2>Build something with your Agent</h2>
                 </div>
-                <div className="session-info">
-                  <span className="pulse" />
-                  {selected.codexThreadId ? "Session connected" : "New session"}
+                <div className="playground-actions">
+                  <div className="session-info">
+                    <span className="pulse" />
+                    {selected.codexThreadId ? "Session connected" : "New session"}
+                  </div>
                 </div>
               </div>
 
               <div className="messages">
-                {messages.length === 0 && !activeRun ? (
-                  <div className="welcome">
-                    <div className="welcome-orbit">
-                      <div>⌁</div>
-                    </div>
-                    <h3>What should {selected.name} build?</h3>
-                    <p>
-                      The Agent can inspect files, write code, run commands, and continue the
-                      same Codex session across messages.
-                    </p>
-                    <div className="prompt-grid">
-                      {starterPrompts.map((item) => (
-                        <button key={item} onClick={() => setPrompt(item)}>
-                          <span>↗</span>
-                          {item}
+                {activeTab === "chat" ? (
+                  <>
+                    {messages.length === 0 && !activeRun ? (
+                      <div className="welcome">
+                        <div className="welcome-orbit">
+                          <div>⌁</div>
+                        </div>
+                        <h3>What should {selected.name} build?</h3>
+                        <p>
+                          The Agent can inspect files, write code, run commands, and continue the
+                          same Codex session across messages.
+                        </p>
+                        <div className="prompt-grid">
+                          {starterPrompts.map((item) => (
+                            <button key={item} onClick={() => setPrompt(item)}>
+                              <span>↗</span>
+                              {item}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      messages.map((message) => (
+                        <article className={"message message-" + message.role} key={message.id}>
+                          <div className="message-meta">
+                            <strong>{message.role === "user" ? "You" : selected.name}</strong>
+                            <span>{formatTime(message.createdAt)}</span>
+                          </div>
+                          <div className="message-body">{message.content}</div>
+                        </article>
+                      ))
+                    )}
+                    {activeRun && ["queued", "running"].includes(activeRun.status) && (
+                      <article className="message message-assistant thinking">
+                        <div className="message-meta">
+                          <strong>{selected.name}</strong>
+                          <span>working in the Agent workspace</span>
+                        </div>
+                        <div className="thinking-row">
+                          <Spinner />
+                          Codex is reading, editing, or running commands…
+                        </div>
+                      </article>
+                    )}
+                    {runProgress.length > 0 && (
+                      <article className="message message-assistant" style={{ marginTop: 8 }}>
+                        <div className="message-meta">
+                          <strong>Progress</strong>
+                          <span>{runProgress.length} updates</span>
+                        </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                          {runProgress.map((item: { id: string; type: string; label: string; summary: string; detail?: string; timestamp: string }) => (
+                            <div
+                              key={item.id}
+                              style={{
+                                display: "grid",
+                                gridTemplateColumns: "12px minmax(0,1fr)",
+                                gap: 10,
+                                alignItems: "start",
+                                paddingLeft: 4,
+                              }}
+                            >
+                              <div
+                                style={{
+                                  width: 10,
+                                  height: 10,
+                                  borderRadius: "50%",
+                                  background: item.type.includes("command") || item.type.includes("validation")
+                                    ? "#a7d8ff"
+                                    : item.type.includes("file")
+                                      ? "#7fe3a5"
+                                      : "#ffd166",
+                                  marginTop: 5,
+                                  boxShadow: "0 0 0 3px rgba(255,255,255,.08)",
+                                }}
+                              />
+                              <div style={{ minWidth: 0 }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                                  <strong style={{ fontSize: 12 }}>{item.label}</strong>
+                                  <span style={{ fontSize: 10, opacity: 0.6 }}>{formatTime(item.timestamp)}</span>
+                                </div>
+                                <div style={{ fontSize: 12, opacity: 0.9, marginTop: 2 }}>{item.summary}</div>
+                                {item.detail && (
+                                  <div style={{ fontSize: 10, opacity: 0.7, marginTop: 3, wordBreak: "break-word" }}>
+                                    {item.detail}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </article>
+                    )}
+                    {activeRun?.status === "failed" && (
+                      <article className="run-error">
+                        <strong>Run failed</strong>
+                        <span>{activeRun.error}</span>
+                      </article>
+                    )}
+                    <div ref={messageEnd} />
+                  </>
+                ) : (
+                  <div className="logs-panel">
+                    <div className="logs-header-row">
+                      <div>
+                        <span className="eyebrow">Agent log stream</span>
+                        <h3>{selected.name}</h3>
+                      </div>
+                      <div className="logs-header-actions">
+                        <span className="logs-count">{agentLogs.length} events</span>
+                        <button type="button" className="button button-ghost" onClick={() => void copyActivityLog()}>
+                          {logCopied ? "Copied" : "Copy log"}
                         </button>
-                      ))}
+                      </div>
+                    </div>
+                    <div className="logs-layout">
+                      <div className="logs-list-pane">
+                        {activityRunGroups.length === 0 ? (
+                          <div className="empty-log-state">No logs yet — start a run to populate the activity stream.</div>
+                        ) : (
+                          activityRunGroups.map((group) => {
+                            const isCollapsed = !expandedRunGroupIds.has(group.id);
+                            return (
+                              <section key={group.id} className="run-log-group">
+                                <button
+                                  type="button"
+                                  className={"run-log-group-header" + (group.denyCount > 0 ? " run-log-group-deny" : group.allowCount > 0 ? " run-log-group-allow" : "")}
+                                  onClick={() => toggleRunGroup(group.id)}
+                                  aria-expanded={!isCollapsed}
+                                >
+                                  <div>
+                                    <span className="eyebrow">{group.label}</span>
+                                    <strong>{group.prompt ?? "Agent configuration and lifecycle activity"}</strong>
+                                    {group.status && <small>{group.status}</small>}
+                                    <span className="run-log-group-outcome">{groupOutcomeSummary(group)}</span>
+                                  </div>
+                                  <div className="run-log-group-meta">
+                                    <span>{group.logs.length} events</span>
+                                    {(group.allowCount > 0 || group.denyCount > 0) && <span>{group.allowCount} allow · {group.denyCount} deny</span>}
+                                    <span>{isCollapsed ? "Expand" : "Collapse"}</span>
+                                  </div>
+                                </button>
+                                {!isCollapsed && (
+                                  <div className="run-log-group-events">
+                                    <span className="run-log-group-events-label">Technical activity</span>
+                                    {group.logs.map((log) => (
+                                      <button
+                                        key={log.id}
+                                        type="button"
+                                        className={"log-list-item risk-row-" + log.riskLevel + (selectedLog?.id === log.id ? " log-list-item-selected" : "")}
+                                        onClick={() => setSelectedLogId(log.id)}
+                                      >
+                                        <div className="log-list-top">
+                                          <span className={"risk-badge risk-" + log.riskLevel}>{formatRiskLabel(log.riskLevel)}</span>
+                                          <span className="log-list-time">{formatTime(log.timestamp)}</span>
+                                        </div>
+                                        <strong>{activityActionLabel(log)}</strong>
+                                        <span>{log.source === "access" ? log.scope ?? "No required scope" : activitySourceLabel(log.source)}</span>
+                                        <small>{activityPreview(log)}</small>
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
+                              </section>
+                            );
+                          })
+                        )}
+                      </div>
+
+                      <aside className="log-detail-pane">
+                        {selectedLog ? (
+                          <>
+                            <div className="log-detail-header">
+                              <div>
+                                <span className="eyebrow">Activity Detail</span>
+                                <h4>{activityActionLabel(selectedLog)}</h4>
+                              </div>
+                              <span className={"risk-badge risk-" + selectedLog.riskLevel}>{formatRiskLabel(selectedLog.riskLevel)}</span>
+                            </div>
+
+                            <div className="log-detail-card">
+                              <div className={"activity-outcome " + activityOutcomeClass(selectedLog)}>
+                                <span>Outcome</span>
+                                <strong>{activityOutcomeLabel(selectedLog)}</strong>
+                                <p>{activitySummary(selectedLog)}</p>
+                                {(selectedLog.source === "access" || selectedLog.source === "lifecycle") && (
+                                  <p className="activity-outcome-reason"><b>{selectedLog.decision === "allow" ? "Why allowed:" : "Why blocked:"}</b> {authorizationReason(selectedLog)}</p>
+                                )}
+                                {selectedLog.source === "access" && (selectedLog.riskScore !== null || selectedLog.riskFactors.length > 0) && (
+                                  <p className="activity-outcome-risk"><b>Risk:</b> {selectedLog.riskScore !== null ? `${formatRiskLabel(selectedLog.riskLevel)} · ${selectedLog.riskScore}/100` : formatRiskLabel(selectedLog.riskLevel)}{selectedLog.riskFactors.length > 0 ? ` · ${selectedLog.riskFactors.join(", ")}` : ""}</p>
+                                )}
+                                <small>{activitySourceLabel(selectedLog.source)}</small>
+                              </div>
+                              <span className="technical-evidence-heading">Technical evidence</span>
+                              <div className="log-detail-grid">
+                                {selectedLog.source === "access" && (
+                                  <>
+                                    <div><label>Delegated by</label><strong>{selectedLog.userId}</strong></div>
+                                    <div><label>Agent identity</label><strong>{selectedLog.agentPrincipalId ?? "—"}</strong></div>
+                                  </>
+                                )}
+                                {selectedLog.source === "lifecycle" && <div><label>Started by</label><strong>{selectedLog.userId}</strong></div>}
+                                <div><label>{selectedLog.source === "lifecycle" ? "Target Agent" : "Agent"}</label><strong>{selectedLog.agentName}</strong></div>
+                                {selectedLog.source === "access" && (
+                                  <>
+                                    <div><label>Target resource</label><strong>{selectedLog.resource}</strong></div>
+                                    <div><label>Required permission</label><strong>{permissionDescription(selectedLog)}</strong></div>
+                                    <div><label>Technical permission</label><strong>{selectedLog.scope ?? "—"}</strong></div>
+                                    <div><label>HTTP method</label><strong>{selectedLog.method ?? "—"}</strong></div>
+                                  </>
+                                )}
+                                {selectedLog.runId && <div><label>Run</label><strong>{selectedLog.runId}</strong></div>}
+                                <div><label>Time</label><strong>{formatDateTime(selectedLog.timestamp)}</strong></div>
+                                {(selectedLog.source === "access" || selectedLog.source === "lifecycle") ? (
+                                  <div><label>{selectedLog.source === "lifecycle" ? "Ownership check" : "Access decision"}</label><strong>{decisionOutcomeLabel(selectedLog)}</strong></div>
+                                ) : (
+                                  <div><label>Status</label><strong>{activityStatusLabel(selectedLog)}</strong></div>
+                                )}
+                              </div>
+
+                              {selectedLog.source === "runtime" && selectedLog.resource === "error" && (
+                                <div className="log-detail-block">
+                                  <label>What this means</label>
+                                  <p>{runtimeWarningExplanation(selectedLog)}</p>
+                                </div>
+                              )}
+                              {(selectedLog.source === "workflow" || (selectedLog.source === "runtime" && selectedLog.resource !== "error")) && selectedLog.detail !== selectedLog.summary && (
+                                <div className="log-detail-block">
+                                  {commandFromDetail(selectedLog.detail) ? (
+                                    <>
+                                      <label>Command</label>
+                                      <pre className="log-command"><code>{commandFromDetail(selectedLog.detail)}</code></pre>
+                                      {outputFromCommandDetail(selectedLog.detail) && <><label>Output</label><p>{outputFromCommandDetail(selectedLog.detail)}</p></>}
+                                    </>
+                                  ) : (
+                                    <><label>Event detail</label><p>{selectedLog.detail}</p></>
+                                  )}
+                                </div>
+                              )}
+                              {selectedLog.source === "response" && (
+                                <div className="log-detail-block">
+                                  <label>Codex response</label>
+                                  <pre className="log-response">{selectedLog.detail}</pre>
+                                </div>
+                              )}
+
+                              <div className="log-footer">
+                                {selectedLog.runId && <span>Run {selectedLog.runId.slice(0, 8)}</span>}
+                                {selectedLog.agentId && <span>Agent {selectedLog.agentId.slice(0, 8)}</span>}
+                                <span>{activityOutcomeLabel(selectedLog)}</span>
+                              </div>
+                            </div>
+                          </>
+                        ) : (
+                          <div className="empty-log-state">Select a log item to inspect the details.</div>
+                        )}
+                      </aside>
                     </div>
                   </div>
-                ) : (
-                  messages.map((message) => (
-                    <article className={"message message-" + message.role} key={message.id}>
-                      <div className="message-meta">
-                        <strong>{message.role === "user" ? "You" : selected.name}</strong>
-                        <span>{formatTime(message.createdAt)}</span>
-                      </div>
-                      <div className="message-body">{message.content}</div>
-                    </article>
-                  ))
                 )}
-                {activeRun && ["queued", "running"].includes(activeRun.status) && (
-                  <article className="message message-assistant thinking">
-                    <div className="message-meta">
-                      <strong>{selected.name}</strong>
-                      <span>working in the Agent workspace</span>
-                    </div>
-                    <div className="thinking-row">
-                      <Spinner />
-                      Codex is reading, editing, or running commands…
-                    </div>
-                  </article>
-                )}
-                {activeRun?.status === "failed" && (
-                  <article className="run-error">
-                    <strong>Run failed</strong>
-                    <span>{activeRun.error}</span>
-                  </article>
-                )}
-                <div ref={messageEnd} />
               </div>
 
-              <form className="composer" onSubmit={sendMessage}>
+              {activeTab === "chat" && (
+                <form className="composer" onSubmit={sendMessage}>
                 <textarea
                   value={prompt}
                   onChange={(event) => setPrompt(event.target.value)}
@@ -612,98 +2037,29 @@ export default function App() {
                   disabled={
                     selected.status === "stopped" ||
                     selected.status === "busy" ||
-                    activeRun != null && ["queued", "running"].includes(activeRun.status)
+                    (activeRun != null && ["queued", "running"].includes(activeRun.status))
                   }
                   rows={3}
                 />
-                <div className="composer-footer">
-                  <span>
-                    Enter to send · Shift + Enter for newline · {system?.codexSandboxMode ?? "checking sandbox"}
-                  </span>
-                  <button
-                    className="send-button"
-                    disabled={
-                      !prompt.trim() ||
-                      selected.status === "stopped" ||
-                      selected.status === "busy" ||
-                      (activeRun != null && ["queued", "running"].includes(activeRun.status))
-                    }
-                    aria-label="Send message"
-                  >
-                    ↑
-                  </button>
-                </div>
-              </form>
-            </section>
-
-            <section
-              className="audit-panel"
-              style={{
-                marginTop: 16,
-                padding: "16px 20px",
-                border: "1px solid rgba(255,255,255,.08)",
-                borderRadius: 14,
-              }}
-            >
-              <div className="playground-topbar" style={{ marginBottom: 12 }}>
-                <div>
-                  <span className="eyebrow">Bouncer audit</span>
-                  <h2>Policy decisions</h2>
-                </div>
-                <div className="session-info">
-                  {audit.length} decision{audit.length === 1 ? "" : "s"}
-                </div>
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {audit.length === 0 ? (
-                  <div style={{ color: "rgba(255,255,255,.5)", fontSize: 13 }}>
-                    No policy decisions recorded for this Agent yet. Send a prompt that asks the
-                    Agent to curl the mock resource service.
-                  </div>
-                ) : (
-                  audit.map((row) => (
-                    <div
-                      key={row.id}
-                      style={{
-                        display: "grid",
-                        gridTemplateColumns: "auto auto 1fr auto auto",
-                        gap: 8,
-                        alignItems: "center",
-                        padding: "6px 8px",
-                        borderRadius: 8,
-                        background:
-                          row.decision === "deny"
-                            ? "rgba(255,80,80,.08)"
-                            : "rgba(80,220,120,.06)",
-                      }}
+                  <div className="composer-footer">
+                    <span>
+                      Enter to send · Shift + Enter for newline · {system?.codexSandboxMode ?? "checking sandbox"}
+                    </span>
+                    <button
+                      className="send-button"
+                      disabled={
+                        !prompt.trim() ||
+                        selected.status === "stopped" ||
+                        selected.status === "busy" ||
+                        (activeRun != null && ["queued", "running"].includes(activeRun.status))
+                      }
+                      aria-label="Send message"
                     >
-                      <span
-                        className={"mini-dot mini-" + (row.decision === "allow" ? "ready" : "error")}
-                      />
-                      <strong
-                        style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: ".04em" }}
-                      >
-                        {row.decision}
-                      </strong>
-                      <span
-                        style={{
-                          fontSize: 13,
-                          fontFamily: "monospace",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        {row.method ?? "—"} {row.resource}
-                      </span>
-                      <span style={{ fontSize: 12, opacity: 0.7 }}>{row.reason}</span>
-                      <span style={{ fontSize: 12, opacity: 0.5 }}>
-                        {formatTime(row.timestamp)}
-                      </span>
-                    </div>
-                  ))
-                )}
-              </div>
+                      ↑
+                    </button>
+                  </div>
+                </form>
+              )}
             </section>
           </>
         ) : (
@@ -716,6 +2072,9 @@ export default function App() {
               className="button button-primary"
               onClick={() => {
                 setForm(emptyForm);
+                setIntent("");
+                setPlan(null);
+                setCreateScopes(new Set());
                 setShowCreate(true);
               }}
             >
@@ -725,20 +2084,447 @@ export default function App() {
         )}
       </main>
 
+      {(activeTab === "logs" || currentRole !== "admin") && (
+      <aside className="policy-console">
+        {activeTab === "logs" ? (
+          <div className="focused-logs">
+            <div className="logs-header-row">
+              <div>
+                <span className="eyebrow">Log stream</span>
+                <h3>{currentRole === "admin" ? "All agent activity" : selected?.name ?? "Agent activity"}</h3>
+              </div>
+              <div className="logs-header-actions">
+                <span className="logs-count">{agentLogs.length} events</span>
+                <button type="button" className="button button-ghost" onClick={() => void copyActivityLog()}>
+                  {logCopied ? "Copied" : "Copy log"}
+                </button>
+              </div>
+            </div>
+            <div className="audit-filter-row">
+              {(["all", "allow", "deny"] as const).map((filter) => (
+                <button
+                  key={filter}
+                  type="button"
+                  className={"audit-filter" + (auditFilter === filter ? " audit-filter-active" : "")}
+                  onClick={() => setAuditFilter(filter)}
+                >
+                  {filter}
+                </button>
+              ))}
+            </div>
+            <div className="focused-log-list">
+              {agentLogs
+                .filter((log) => auditFilter === "all" || log.decision === auditFilter)
+                .map((log) => (
+                  <button
+                    key={log.id}
+                    type="button"
+                    className={"focused-log risk-row-" + log.riskLevel + (selectedLog?.id === log.id ? " focused-log-selected" : "")}
+                    onClick={() => setSelectedLogId(log.id)}
+                  >
+                    <span className="focused-log-status">{log.decision}</span>
+                    <strong>{activityActionLabel(log)}</strong>
+                    <span>{log.userId} · {log.agentName} · {log.resource}</span>
+                    <small>{activityPreview(log)}</small>
+                    <time>{formatTime(log.timestamp)}</time>
+                  </button>
+                ))}
+              {agentLogs.filter((log) => auditFilter === "all" || log.decision === auditFilter).length === 0 && (
+                <div className="empty-log-state">No matching logs.</div>
+              )}
+            </div>
+            {selectedLog && (
+              <div className="focused-log-detail">
+                <div className="log-detail-header">
+                  <div>
+                    <span className="eyebrow">Activity Detail</span>
+                    <h4>{activityActionLabel(selectedLog)}</h4>
+                  </div>
+                  <span className={"risk-badge risk-" + selectedLog.riskLevel}>{formatRiskLabel(selectedLog.riskLevel)}</span>
+                </div>
+                <div className={"activity-outcome " + activityOutcomeClass(selectedLog)}>
+                  <span>Outcome</span>
+                  <strong>{activityOutcomeLabel(selectedLog)}</strong>
+                  <p>{activitySummary(selectedLog)}</p>
+                  {(selectedLog.source === "access" || selectedLog.source === "lifecycle") && (
+                    <p className="activity-outcome-reason"><b>{selectedLog.decision === "allow" ? "Why allowed:" : "Why blocked:"}</b> {authorizationReason(selectedLog)}</p>
+                  )}
+                  {selectedLog.source === "access" && (selectedLog.riskScore !== null || selectedLog.riskFactors.length > 0) && (
+                    <p className="activity-outcome-risk"><b>Risk:</b> {selectedLog.riskScore !== null ? `${formatRiskLabel(selectedLog.riskLevel)} · ${selectedLog.riskScore}/100` : formatRiskLabel(selectedLog.riskLevel)}{selectedLog.riskFactors.length > 0 ? ` · ${selectedLog.riskFactors.join(", ")}` : ""}</p>
+                  )}
+                  <small>{activitySourceLabel(selectedLog.source)}</small>
+                </div>
+                <span className="technical-evidence-heading">Technical evidence</span>
+                <div className="log-detail-grid">
+                  {selectedLog.source === "access" && (
+                    <>
+                      <div><label>Delegated by</label><strong>{selectedLog.userId}</strong></div>
+                      <div><label>Agent identity</label><strong>{selectedLog.agentPrincipalId ?? "—"}</strong></div>
+                    </>
+                  )}
+                  {selectedLog.source === "lifecycle" && <div><label>Started by</label><strong>{selectedLog.userId}</strong></div>}
+                  <div><label>{selectedLog.source === "lifecycle" ? "Target Agent" : "Agent"}</label><strong>{selectedLog.agentName}</strong></div>
+                  {selectedLog.source === "access" && (
+                    <>
+                      <div><label>Target resource</label><strong>{selectedLog.resource}</strong></div>
+                      <div><label>Required permission</label><strong>{permissionDescription(selectedLog)}</strong></div>
+                      <div><label>Technical permission</label><strong>{selectedLog.scope ?? "—"}</strong></div>
+                      <div><label>HTTP method</label><strong>{selectedLog.method ?? "—"}</strong></div>
+                    </>
+                  )}
+                  {selectedLog.runId && <div><label>Run</label><strong>{selectedLog.runId}</strong></div>}
+                  <div><label>Time</label><strong>{formatDateTime(selectedLog.timestamp)}</strong></div>
+                  {(selectedLog.source === "access" || selectedLog.source === "lifecycle") ? (
+                    <div><label>{selectedLog.source === "lifecycle" ? "Ownership check" : "Access decision"}</label><strong>{decisionOutcomeLabel(selectedLog)}</strong></div>
+                  ) : (
+                    <div><label>Status</label><strong>{activityStatusLabel(selectedLog)}</strong></div>
+                  )}
+                </div>
+                {selectedLog.source === "runtime" && selectedLog.resource === "error" && (
+                  <div className="log-detail-block">
+                    <label>What this means</label>
+                    <p>{runtimeWarningExplanation(selectedLog)}</p>
+                  </div>
+                )}
+                {(selectedLog.source === "workflow" || (selectedLog.source === "runtime" && selectedLog.resource !== "error")) && selectedLog.detail !== selectedLog.summary && (
+                  <div className="log-detail-block">
+                    {commandFromDetail(selectedLog.detail) ? (
+                      <>
+                        <label>Command</label>
+                        <pre className="log-command"><code>{commandFromDetail(selectedLog.detail)}</code></pre>
+                        {outputFromCommandDetail(selectedLog.detail) && <><label>Output</label><p>{outputFromCommandDetail(selectedLog.detail)}</p></>}
+                      </>
+                    ) : (
+                      <><label>Event detail</label><p>{selectedLog.detail}</p></>
+                    )}
+                  </div>
+                )}
+                {selectedLog.source === "response" && (
+                  <div className="log-detail-block">
+                    <label>Codex response</label>
+                    <pre className="log-response">{selectedLog.detail}</pre>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        ) : currentRole !== "admin" && selected ? (
+          <>
+            <div className="policy-tabs">
+              {POLICY_TABS.map((tab) => (
+                <button
+                  key={tab}
+                  type="button"
+                  className={"policy-tab" + (policyTab === tab ? " policy-tab-active" : "")}
+                  onClick={() => setPolicyTab(tab)}
+                >
+                  {tab}
+                </button>
+              ))}
+            </div>
+
+            {policyTab === "permissions" && (
+              <div className="policy-section">
+                <div className="playground-topbar" style={{ marginBottom: 4 }}>
+                  <div>
+                    <span className="eyebrow">Permissions</span>
+                    {selected.plan && (
+                      <span style={{ fontSize: 11, opacity: 0.6, marginLeft: 6 }}>
+                        plan: {selected.plan.source}
+                      </span>
+                    )}
+                  </div>
+                  <button
+                    className="button button-danger"
+                    style={{ minHeight: 30, fontSize: 11, padding: "0 10px" }}
+                    disabled={busy || selectedForRevoke.size === 0}
+                    onClick={revokeSelected}
+                  >
+                    Revoke selected ({selectedForRevoke.size})
+                  </button>
+                </div>
+
+                {ownerRole === "admin" && (
+                  <div className="perm-bypass">
+                    Owner is an admin — the relay grants all requests (capability check bypassed).
+                  </div>
+                )}
+
+                {selected.plan?.intent && (
+                  <p className="perm-intent">Intent: {selected.plan.intent}</p>
+                )}
+
+                <div className="owner-scope-list">
+                  {(selected.scopes ?? []).length === 0 ? (
+                    <div className="perm-empty">No permissions granted to this agent.</div>
+                  ) : (
+                    (selected.scopes ?? []).map((scope) => {
+                      const risk = classifyScopeClient(scope);
+                      return (
+                        <div className="owner-scope" key={scope}>
+                          <span
+                            className={"mini-dot mini-" + (risk === "baseline" ? "ready" : "warning")}
+                          />
+                          <code>{scope}</code>
+                          <label className="perm-check">
+                            <input
+                              type="checkbox"
+                              checked={selectedForRevoke.has(scope)}
+                              onChange={() => toggleRevokeSelect(scope)}
+                              disabled={busy}
+                            />
+                          </label>
+                          <button
+                            className="perm-x"
+                            onClick={() => revokeScope(scope)}
+                            disabled={busy}
+                            title="Revoke scope"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+
+                {selected.plan && (
+                  <details className="perm-plan" style={{ marginTop: 4 }}>
+                    <summary>View plan</summary>
+                    <div className="perm-plan-body">
+                      <p>{selected.plan.justification}</p>
+                      <p>requested: {selected.plan.requestedScopes.join(", ") || "—"}</p>
+                      <p>baseline: {selected.plan.baselineScopes.join(", ") || "—"}</p>
+                      <p>elevated: {selected.plan.elevatedScopes.join(", ") || "—"}</p>
+                      <p>unknown: {selected.plan.unknownScopes.join(", ") || "—"}</p>
+                    </div>
+                  </details>
+                )}
+
+                <details style={{ marginTop: 4 }}>
+                  <summary className="perm-ref-summary">Policy reference</summary>
+                  <div className="perm-ref">
+                    <p>🟢 baseline: read:secrets:&lt;own&gt;, act:deploy:dev</p>
+                    <p>🟠 elevated: write:*, read cross-user, act:deploy:prod</p>
+                    <p>🔴 unknown: rejected</p>
+                  </div>
+                </details>
+              </div>
+            )}
+
+            {policyTab === "vault" && (
+              <div className="policy-section">
+                <div className="playground-topbar" style={{ marginBottom: 4 }}>
+                  <div>
+                    <span className="eyebrow">Vault</span>
+                  </div>
+                </div>
+
+                <div className="perm-empty">
+                  Secrets are centralized and admin-managed. This is the read-only catalog
+                  (redacted views only — the raw value never leaves the server).
+                </div>
+
+                <div className="vault-grid">
+                  {secrets.map((s) => (
+                    <div className="vault-card" key={s.key}>
+                      <div className="vault-card-head">
+                        <code className="vault-key">{s.key}</code>
+                      </div>
+                      <div className="vault-redacted">{s.redactedView}</div>
+                    </div>
+                  ))}
+                  {secrets.length === 0 && (
+                    <div className="perm-empty">No secrets registered yet.</div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {policyTab === "owner" && (
+              <div className="policy-section">
+                <div className="owner-ownerbar">
+                  <div>
+                    <span className="eyebrow">Owner view</span>
+                    <h2>Agents owned by {currentUser}</h2>
+                    <p className="owner-note" style={{ margin: "2px 0 0" }}>
+                      These are your agents and the permissions each was granted. Owner-based:
+                      only agents you own appear here — the selected one is expanded.
+                    </p>
+                  </div>
+                  <span className="eyebrow">{agents.length}</span>
+                </div>
+
+                <div className="owner-card">
+                  <div className="owner-scopes-head">
+                    <span className="eyebrow">Your permissions</span>
+                    <span className="eyebrow">{myScopes.length}</span>
+                  </div>
+                  <p className="owner-note" style={{ margin: "0 0 6px" }}>
+                    The permissions you inherit as {currentUser} (granted by an admin).
+                  </p>
+                  <div className="owner-scope-list">
+                    {myScopes.length === 0 ? (
+                      <div className="perm-empty">You have no inherent permissions.</div>
+                    ) : (
+                      myScopes.map((scope) => {
+                        const risk = classifyScopeClient(scope);
+                        return (
+                          <div className="owner-scope" key={scope}>
+                            <span
+                              className={"mini-dot mini-" + (risk === "baseline" ? "ready" : "warning")}
+                            />
+                            <code>{scope}</code>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+
+                {agents.length === 0 ? (
+                  <div className="perm-empty">You own no agents yet.</div>
+                ) : (
+                  <div className="owner-accordion">
+                    {agents.map((agent) => {
+                      const expanded = agent.id === selectedId;
+                      return (
+                        <div
+                          key={agent.id}
+                          className={"owner-agent" + (expanded ? " owner-agent-open" : "")}
+                        >
+                          <button
+                            type="button"
+                            className="owner-agent-head"
+                            onClick={() => setSelectedId(agent.id)}
+                          >
+                            <span className={"mini-dot mini-" + agent.status} />
+                            <strong>{agent.name}</strong>
+                            <span className="owner-agent-meta">
+                              {agent.scopes?.length ?? 0} scopes · {agent.status}
+                            </span>
+                            {agent.plan && (
+                              <span className="admin-chip">{agent.plan.source}</span>
+                            )}
+                            <span className="owner-chevron">{expanded ? "▾" : "▸"}</span>
+                          </button>
+
+                          {expanded && (
+                            <div className="owner-agent-body">
+                              <div className="owner-kv-grid">
+                                <div className="owner-kv">
+                                  <span>id</span>
+                                  <code>{agent.id.slice(0, 8)}</code>
+                                </div>
+                                <div className="owner-kv">
+                                  <span>session</span>
+                                  <code>
+                                    {agent.codexThreadId
+                                      ? agent.codexThreadId.slice(0, 8)
+                                      : "none"}
+                                  </code>
+                                </div>
+                                <div className="owner-kv">
+                                  <span>created</span>
+                                  <code>{formatTime(agent.createdAt)}</code>
+                                </div>
+                              </div>
+
+                              <div className="owner-scopes">
+                                <div className="owner-scopes-head">
+                                  <span className="eyebrow">
+                                    Permissions · {agent.scopes?.length ?? 0}
+                                  </span>
+                                  <button
+                                    className="button button-danger"
+                                    style={{ minHeight: 28, fontSize: 10, padding: "0 8px" }}
+                                    disabled={busy || selectedForRevoke.size === 0}
+                                    onClick={revokeSelected}
+                                  >
+                                    Revoke selected ({selectedForRevoke.size})
+                                  </button>
+                                </div>
+                                {(agent.scopes ?? []).length === 0 ? (
+                                  <div className="perm-empty">No scopes granted.</div>
+                                ) : (
+                                  <div className="owner-scope-list">
+                                    {(agent.scopes ?? []).map((scope) => {
+                                      const risk = classifyScopeClient(scope);
+                                      return (
+                                        <div key={scope} className="owner-scope">
+                                          <span
+                                            className={
+                                              "mini-dot mini-" +
+                                              (risk === "baseline" ? "ready" : "warning")
+                                            }
+                                          />
+                                          <code>{scope}</code>
+                                          <label className="perm-check">
+                                            <input
+                                              type="checkbox"
+                                              checked={selectedForRevoke.has(scope)}
+                                              onChange={() => toggleRevokeSelect(scope)}
+                                              disabled={busy}
+                                            />
+                                          </label>
+                                          <button
+                                            className="perm-x"
+                                            onClick={() => revokeScope(scope)}
+                                            disabled={busy}
+                                            title="Revoke scope"
+                                          >
+                                            ×
+                                          </button>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                              </div>
+
+                              <button
+                                className="button button-ghost"
+                                style={{ minHeight: 30, fontSize: 11, alignSelf: "flex-start" }}
+                                onClick={revokeCredential}
+                                disabled={busy || agent.status === "busy"}
+                              >
+                                Revoke credential
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="perm-empty">Select an agent to see its permissions + decisions.</div>
+        )}
+      </aside>
+      )}
+
       {showCreate && (
         <div className="modal-backdrop" onMouseDown={() => setShowCreate(false)}>
           <form
             className="modal"
-            onSubmit={createAgent}
+            onSubmit={plan ? approveAndCreate : planIntent}
             onMouseDown={(event) => event.stopPropagation()}
           >
             <div className="modal-heading">
               <div>
-                <span className="eyebrow">New workspace</span>
+                <span className="eyebrow">Intent-bound permissions</span>
                 <h2>Create an Agent</h2>
-                <p>Each Agent gets a persistent folder and a resumable Codex session.</p>
+                <p>
+                  State what you want the agent to do — the planner derives the minimum
+                  permissions; you approve the risky ones.
+                </p>
               </div>
-              <button type="button" onClick={() => setShowCreate(false)}>×</button>
+              <button type="button" onClick={() => setShowCreate(false)}>
+                ×
+              </button>
             </div>
             <label>
               Name
@@ -752,27 +2538,82 @@ export default function App() {
               />
             </label>
             <label>
-              Description
-              <input
-                placeholder="Builds polished React prototypes"
-                value={form.description}
-                onChange={(event) =>
-                  setForm({ ...form, description: event.target.value })
-                }
-                maxLength={500}
-              />
-            </label>
-            <label>
-              Instructions
+              Intent
               <textarea
-                value={form.instructions}
-                onChange={(event) =>
-                  setForm({ ...form, instructions: event.target.value })
-                }
-                rows={6}
+                placeholder="e.g. build a todo app that reads my DB url and deploys to dev"
+                value={intent}
+                onChange={(event) => {
+                  setIntent(event.target.value);
+                  setPlan(null);
+                }}
+                rows={3}
                 maxLength={10_000}
               />
             </label>
+            {plan && (
+              <div
+                style={{
+                  marginTop: 8,
+                  padding: "12px 14px",
+                  border: "1px solid rgba(255,255,255,.1)",
+                  borderRadius: 12,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 8,
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                  }}
+                >
+                  <span className="eyebrow">Permissions plan · {plan.source}</span>
+                  <span style={{ fontSize: 12, opacity: 0.6 }}>
+                    {plan.baselineScopes.length} baseline · {plan.elevatedScopes.length}{" "}
+                    elevated · {plan.unknownScopes.length} unknown
+                  </span>
+                </div>
+                <p style={{ fontSize: 13, opacity: 0.85, margin: 0 }}>{plan.justification}</p>
+                <p className="owner-note" style={{ margin: "0 0 4px" }}>
+                  Pick the permissions for this agent. The plan suggested the checked ones — adjust as needed.
+                </p>
+                <div className="admin-wizard-catalog">
+                  {catalog.groups.map((group) => (
+                    <div key={group.label} className="admin-group">
+                      <div className="admin-group-title">{group.label}</div>
+                      {group.entries.map((entry) => (
+                        <label
+                          key={entry.scope}
+                          className={
+                            "admin-perm admin-perm-toggle" +
+                            (createScopes.has(entry.scope) ? " admin-perm-active" : "")
+                          }
+                        >
+                          <span
+                            className={
+                              "mini-dot mini-" + (entry.risk === "baseline" ? "ready" : "warning")
+                            }
+                          />
+                          <code>{entry.scope}</code>
+                          <input
+                            type="checkbox"
+                            checked={createScopes.has(entry.scope)}
+                            onChange={() => toggleCreateScope(entry.scope)}
+                          />
+                        </label>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+                {plan.unknownScopes.length > 0 && (
+                  <div className="perm-empty" style={{ marginTop: 4 }}>
+                    Rejected (not in taxonomy): {plan.unknownScopes.join(", ")}
+                  </div>
+                )}
+              </div>
+            )}
             <div className="modal-footer">
               <button
                 type="button"
@@ -781,11 +2622,350 @@ export default function App() {
               >
                 Cancel
               </button>
-              <button className="button button-primary" disabled={busy}>
-                {busy ? <Spinner /> : "Create Agent"}
+              <button
+                className="button button-primary"
+                disabled={
+                  busy ||
+                  !intent.trim() ||
+                  (plan ? !form.name.trim() : false)
+                }
+              >
+                {busy ? <Spinner /> : plan ? "Approve & create" : "Plan permissions"}
               </button>
             </div>
           </form>
+        </div>
+      )}
+
+      {showAddUser && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={() => {
+            setShowAddUser(false);
+            setAddUserStep(1);
+            setNewUserScopes(new Set());
+          }}
+        >
+          <form
+            className="modal"
+            style={{ width: "min(560px, 100%)" }}
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (addUserStep === 1) {
+                if (newUserForm.userId.trim()) setAddUserStep(2);
+              } else {
+                void submitAddUser();
+              }
+            }}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="modal-heading">
+              <div>
+                <span className="eyebrow">Users &amp; roles</span>
+                <h2>Add user{addUserStep === 2 ? " · permissions" : ""}</h2>
+                <p>
+                  {addUserStep === 1
+                    ? "Register a mock principal. Non-admin users see only their own secrets and agents."
+                    : "Pick the permissions " +
+                      (newUserForm.userId || "the user") +
+                      " inherits. Adjust later in the Admin panel."}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowAddUser(false);
+                  setAddUserStep(1);
+                  setNewUserScopes(new Set());
+                }}
+              >
+                ×
+              </button>
+            </div>
+
+            {addUserStep === 1 ? (
+              <>
+                <label>
+                  User ID
+                  <input
+                    autoFocus
+                    value={newUserForm.userId}
+                    onChange={(event) =>
+                      setNewUserForm({ ...newUserForm, userId: event.target.value })
+                    }
+                    required
+                    maxLength={60}
+                    placeholder="e.g. carol"
+                  />
+                </label>
+                <label>
+                  Role
+                  <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                    {(["user", "admin"] as const).map((r) => (
+                      <button
+                        key={r}
+                        type="button"
+                        onClick={() => setNewUserForm({ ...newUserForm, role: r })}
+                        style={{
+                          flex: 1,
+                          minHeight: 36,
+                          borderRadius: 9,
+                          border: "1px solid",
+                          borderColor: newUserForm.role === r ? "#6954d9" : "#d9d7cf",
+                          background: newUserForm.role === r ? "#efecff" : "#fff",
+                          color: newUserForm.role === r ? "#513db9" : "#575851",
+                          fontWeight: 600,
+                          fontSize: 12,
+                          cursor: "pointer",
+                          textTransform: "capitalize",
+                        }}
+                      >
+                        {r}
+                      </button>
+                    ))}
+                  </div>
+                </label>
+              </>
+            ) : (
+              <div className="admin-wizard-catalog">
+                {catalog.groups.map((group) => (
+                  <div key={group.label} className="admin-group">
+                    <div className="admin-group-title">{group.label}</div>
+                    {group.entries.map((entry) => (
+                      <label
+                        key={entry.scope}
+                        className={
+                          "admin-perm admin-perm-toggle" +
+                          (newUserScopes.has(entry.scope) ? " admin-perm-active" : "")
+                        }
+                      >
+                        <span
+                          className={
+                            "mini-dot mini-" +
+                            (entry.risk === "baseline" ? "ready" : "warning")
+                          }
+                        />
+                        <code>{entry.scope}</code>
+                        <input
+                          type="checkbox"
+                          checked={newUserScopes.has(entry.scope)}
+                          onChange={() => toggleNewUserScope(entry.scope)}
+                        />
+                      </label>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {error && (
+              <div className="error-banner" role="alert">
+                <span>{error}</span>
+              </div>
+            )}
+
+            <div className="modal-footer">
+              <button
+                type="button"
+                className="button button-ghost"
+                onClick={() => {
+                  setShowAddUser(false);
+                  setAddUserStep(1);
+                  setNewUserScopes(new Set());
+                }}
+              >
+                Cancel
+              </button>
+              {addUserStep === 1 ? (
+                <button
+                  type="button"
+                  className="button button-primary"
+                  disabled={!newUserForm.userId.trim()}
+                  onClick={() => setAddUserStep(2)}
+                >
+                  Next
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="button button-ghost"
+                    onClick={() => setAddUserStep(1)}
+                  >
+                    Back
+                  </button>
+                  <button type="submit" className="button button-primary" disabled={busy}>
+                    {busy ? <Spinner /> : "Add user"}
+                  </button>
+                </>
+              )}
+            </div>
+          </form>
+        </div>
+      )}
+
+      {showAdmin && currentRole === "admin" && (
+        <div className="modal-backdrop admin-backdrop" onMouseDown={() => setShowAdmin(false)}>
+          <div className="admin-panel" onMouseDown={(event) => event.stopPropagation()}>
+            <header className="admin-header">
+              <div>
+                <span className="eyebrow">Admin</span>
+                <h2>User permissions</h2>
+              </div>
+              <button type="button" onClick={() => setShowAdmin(false)}>
+                ×
+              </button>
+            </header>
+            <div className="admin-body">
+              <aside className="admin-catalog">
+                {catalog.groups.map((group) => (
+                  <div key={group.label} className="admin-group">
+                    <div className="admin-group-title">{group.label}</div>
+                    {group.entries.map((entry) => {
+                      const usersWith = users.filter((u) =>
+                        userHasPermission(u, entry.scope),
+                      );
+                      return (
+                        <button
+                          key={entry.scope}
+                          type="button"
+                          className={
+                            "admin-perm" +
+                            (adminPerm === entry.scope ? " admin-perm-active" : "")
+                          }
+                          onClick={() => setAdminPerm(entry.scope)}
+                        >
+                          <span
+                            className={
+                              "mini-dot mini-" +
+                              (entry.risk === "baseline" ? "ready" : "warning")
+                            }
+                          />
+                          <code>{entry.scope}</code>
+                          <span className="admin-perm-count">{usersWith.length}</span>
+                          <span className="admin-breadcrumbs">
+                            {usersWith.slice(0, 3).map((u) => (
+                              <span key={u.userId} className="admin-chip">
+                                {u.userId}
+                              </span>
+                            ))}
+                            {usersWith.length > 3 && (
+                              <span className="admin-chip admin-chip-more">
+                                +{usersWith.length - 3}
+                              </span>
+                            )}
+                            {usersWith.length === 0 && (
+                              <span className="admin-chip admin-chip-none">no one</span>
+                            )}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ))}
+              </aside>
+              <section className="admin-detail">
+                {adminPerm ? (
+                  <>
+                    <div className="admin-detail-head">
+                      <div>
+                        <span className="eyebrow">Permission</span>
+                        <code className="admin-detail-scope">{adminPerm}</code>
+                      </div>
+                      <span
+                        className={
+                          "role-badge role-" +
+                          (catalog.riskMap.get(adminPerm) === "elevated" ? "admin" : "user")
+                        }
+                      >
+                        {catalog.riskMap.get(adminPerm) ?? "unknown"}
+                      </span>
+                    </div>
+                    <div className="admin-user-list">
+                      {users.map((u) => {
+                        const status = userPermissionStatus(u, adminPerm);
+                        const checked = status.kind !== "none";
+                        const disabled =
+                          busy || status.kind === "admin" || status.kind === "via";
+                        return (
+                          <label
+                            key={u.id}
+                            className={"admin-user" + (checked ? " admin-user-granted" : "")}
+                          >
+                            <div className="admin-user-id">
+                              <strong>{u.userId}</strong>
+                              {u.role === "admin" && (
+                                <span className="role-badge role-admin">admin</span>
+                              )}
+                              {status.kind === "via" && (
+                                <span className="admin-via">via {status.via}</span>
+                              )}
+                            </div>
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              disabled={disabled}
+                              onChange={() => {
+                                if (status.kind === "granted") {
+                                  void revokeScopeFromUser(u.userId, adminPerm);
+                                } else if (status.kind === "none") {
+                                  void grantScopeToUser(u.userId, adminPerm);
+                                }
+                              }}
+                            />
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </>
+                ) : (
+                  <div className="perm-empty">
+                    Select a permission to see which users have access and toggle it per user.
+                  </div>
+                )}
+              </section>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showAdmin && currentRole !== "admin" && (
+        <div className="modal-backdrop" onMouseDown={() => setShowAdmin(false)}>
+          <div
+            className="modal"
+            style={{ width: "min(520px, 100%)" }}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="modal-heading">
+              <div>
+                <span className="eyebrow">My permissions</span>
+                <h2>{currentUser}</h2>
+                <p>The permissions you inherit. Ask an admin to grant more.</p>
+              </div>
+              <button type="button" onClick={() => setShowAdmin(false)}>
+                ×
+              </button>
+            </div>
+            <div className="owner-scope-list">
+              {myScopes.length === 0 ? (
+                <div className="perm-empty">
+                  You have no inherent permissions. An admin can grant them.
+                </div>
+              ) : (
+                myScopes.map((scope) => {
+                  const risk = classifyScopeClient(scope);
+                  return (
+                    <div className="owner-scope" key={scope}>
+                      <span
+                        className={"mini-dot mini-" + (risk === "baseline" ? "ready" : "warning")}
+                      />
+                      <code>{scope}</code>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>

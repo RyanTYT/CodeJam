@@ -18,10 +18,49 @@ declare module "fastify" {
 
 const agentIdParams = z.object({ id: z.string().uuid() });
 const runIdParams = z.object({ id: z.string().uuid() });
+const intentPlanSchema = z.object({
+  intent: z.string(),
+  requestedScopes: z.array(z.string()),
+  baselineScopes: z.array(z.string()),
+  elevatedScopes: z.array(z.string()),
+  unknownScopes: z.array(z.string()),
+  justification: z.string(),
+  source: z.enum(["llm", "fallback"]),
+});
 const createAgentBody = z.object({
   name: z.string().trim().min(1).max(80),
   description: z.string().max(500).optional(),
   instructions: z.string().max(10_000).optional(),
+  intent: z.string().max(10_000).optional(),
+  scopes: z.array(z.string().max(200)).max(32).optional(),
+  plan: intentPlanSchema.optional(),
+});
+const planAgentBody = z.object({
+  intent: z.string().trim().min(1).max(10_000),
+});
+const revokeScopeBody = z.object({
+  scope: z.string().trim().min(1).max(200),
+});
+const secretBody = z.object({
+  key: z.string().trim().min(1).max(120),
+  value: z.string().min(1).max(10_000),
+  redactedView: z.string().max(200).optional(),
+});
+const revokeSecretBody = z.object({
+  key: z.string().trim().min(1).max(120),
+});
+const userBody = z.object({
+  userId: z
+    .string()
+    .trim()
+    .min(1)
+    .max(60)
+    .regex(/^[a-zA-Z0-9_-]+$/, "userId must be URL-safe"),
+  role: z.enum(["admin", "user"]).default("user"),
+  scopes: z.array(z.string().max(200)).max(32).optional(),
+});
+const userIdParams = z.object({
+  userId: z.string().regex(/^[a-zA-Z0-9_-]+$/, "userId must be URL-safe"),
 });
 const updateAgentBody = createAgentBody.partial().refine(
   (value) => Object.keys(value).length > 0,
@@ -66,14 +105,11 @@ export async function createApp(
       const raw = Array.isArray(header) ? header[0] : header;
       const userId =
         typeof raw === "string" && raw.trim().length > 0 ? raw.trim() : "default";
-      request.principal = {
-        kind: "human",
-        id: "user:" + userId,
-        userId,
-        runId: undefined,
-        scopes: [],
-        expiresAt: undefined,
-      };
+      const principal = service.resolvePrincipal(userId);
+      if (!principal) {
+        return reply.code(401).send({ error: "unknown user" });
+      }
+      request.principal = principal;
     }
 
     // Shared operator bearer token (NOT identity). Kept separate from the
@@ -117,6 +153,12 @@ export async function createApp(
     return reply.code(201).send({ agent });
   });
 
+  app.post("/api/agents/plan", async (request, reply) => {
+    const body = planAgentBody.parse(request.body);
+    const plan = await service.planIntent(body.intent, request.principal);
+    return reply.code(200).send({ plan });
+  });
+
   app.get("/api/agents/:id", async (request) => {
     const { id } = agentIdParams.parse(request.params);
     return { agent: service.getAgent(id, request.principal) };
@@ -148,6 +190,12 @@ export async function createApp(
     return service.revokeCredential(id, request.principal);
   });
 
+  app.post("/api/agents/:id/scopes/revoke", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    const body = revokeScopeBody.parse(request.body);
+    return { agent: await service.removeScope(id, body.scope, request.principal) };
+  });
+
   app.get("/api/agents/:id/messages", async (request) => {
     const { id } = agentIdParams.parse(request.params);
     return { messages: service.getMessages(id, request.principal) };
@@ -170,9 +218,81 @@ export async function createApp(
     return { run: service.getRun(id, request.principal) };
   });
 
+  app.get("/api/runs/:id/workflow", async (request) => {
+    const { id } = runIdParams.parse(request.params);
+    return { workflow: service.getWorkflow(id, request.principal) };
+  });
+
   app.get("/api/audit", async (request) => {
     const query = auditQuery.parse(request.query);
     return { audit: service.listAudit(query.agentId, request.principal) };
+  });
+
+  app.get("/api/secrets", async (request) => {
+    return { secrets: service.listSecrets(request.principal) };
+  });
+
+  app.post("/api/secrets", async (request, reply) => {
+    const body = secretBody.parse(request.body);
+    const secret = await service.addSecret(
+      body.key,
+      body.value,
+      body.redactedView,
+      request.principal,
+    );
+    return reply.code(201).send({ secret });
+  });
+
+  app.post("/api/secrets/revoke", async (request) => {
+    const body = revokeSecretBody.parse(request.body);
+    return service.deleteSecret(body.key, request.principal);
+  });
+
+  app.get("/api/me", async (request) => {
+    return {
+      user: { userId: request.principal.userId, role: request.principal.role },
+    };
+  });
+
+  app.get("/api/users", async () => {
+    return { users: service.listUsers() };
+  });
+
+  app.post("/api/users", async (request, reply) => {
+    const body = userBody.parse(request.body);
+    const user = await service.addUser(
+      body.userId,
+      body.role,
+      body.scopes ?? [],
+      request.principal,
+    );
+    return reply.code(201).send({ user });
+  });
+
+  app.post("/api/users/:userId/scopes/grant", async (request) => {
+    const { userId } = userIdParams.parse(request.params);
+    const body = revokeScopeBody.parse(request.body);
+    return { user: await service.grantUserScope(userId, body.scope, request.principal) };
+  });
+
+  app.post("/api/users/:userId/scopes/revoke", async (request) => {
+    const { userId } = userIdParams.parse(request.params);
+    const body = revokeScopeBody.parse(request.body);
+    return { user: await service.revokeUserScope(userId, body.scope, request.principal) };
+  });
+
+  // Debug: mint a Tier-1 credential for a user (admin-only) so the relay
+  // enforcement can be exercised live (curl /mock/proxy/secrets/<key> with the
+  // token) without running an agent. Mirrors a real run's mintCredential gating.
+  app.post("/api/debug/mint-credential", async (request, reply) => {
+    const body = z
+      .object({
+        userId: z.string().regex(/^[a-zA-Z0-9_-]+$/),
+        scopes: z.array(z.string().max(200)).max(32).default([]),
+      })
+      .parse(request.body);
+    const result = await service.mintDebugCredential(body.userId, body.scopes, request.principal);
+    return reply.code(201).send(result);
   });
 
   if (config.nodeEnv === "production") {

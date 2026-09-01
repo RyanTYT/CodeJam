@@ -27,6 +27,13 @@ export interface EgressProxyOptions {
   allowPathPrefixes: string[];
   /** Bind address (default 0.0.0.0 — reachable from the container bridge). */
   host?: string;
+  /**
+   * The host the proxy connects to when forwarding (default "127.0.0.1"). The
+   * egress proxy runs on the host alongside the relay; host.docker.internal
+   * (the URL host the agent curls) doesn't resolve on the host, so the proxy
+   * connects to the co-located loopback while keeping the original Host header.
+   */
+  upstreamHost?: string;
 }
 
 export async function startEgressProxy(opts: EgressProxyOptions): Promise<EgressProxy> {
@@ -107,7 +114,11 @@ function handleHttp(
   const upstream = http.request(
     {
       method: req.method ?? "GET",
-      host: url.hostname,
+      // The egress proxy runs on the HOST alongside the relay; host.docker.internal
+      // is a container-only name that doesn't resolve on the host. Forward to the
+      // co-located loopback (default) — the relay listens on 0.0.0.0:<port> — while
+      // keeping the original Host header so the relay sees the expected host.
+      host: opts.upstreamHost ?? "127.0.0.1",
       port: url.port ? Number(url.port) : 80,
       path,
       headers: {

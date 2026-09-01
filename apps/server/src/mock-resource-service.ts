@@ -1,7 +1,20 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import type { JsonStore } from "./store.js";
-import type { AgentCredential, Audit, DeployState, MockResource } from "./types.js";
+import { encrypt, decrypt } from "./secret-cipher.js";
+import type {
+  AgentCredential,
+  Audit,
+  AuthorizationContext,
+  AuthorizationDecision,
+  Capability,
+  DeployState,
+  MockResource,
+  RequestedCapability,
+  Secret,
+  User,
+} from "./types.js";
+import { calculateAgentRiskProfile, assessOperationRisk } from "./risk-engine.js";
 
 const now = () => new Date().toISOString();
 const TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
@@ -26,22 +39,19 @@ export interface UpstreamResult {
 
 const SEED_RESOURCES: MockResource[] = [
   {
-    owner: "alice",
-    key: "db-url",
-    value: "postgres://alice:s3cret@db.alice.local/agentdb",
-    redactedView: "postgres://***:***@db.alice.local/agentdb",
+    key: "dev-db-url",
+    value: "postgres://dev:s3cret@db.dev.local/agentdb",
+    redactedView: "postgres://***:***@db.dev.local/agentdb",
   },
   {
-    owner: "bob",
-    key: "db-url",
-    value: "postgres://bob:p4ssw0rd@db.bob.local/agentdb",
-    redactedView: "postgres://***:***@db.bob.local/agentdb",
-  },
-  {
-    owner: "prod",
-    key: "db-url",
+    key: "prod-db-url",
     value: "postgres://prod:pr0d-secret@db.prod.local/agentdb",
     redactedView: "postgres://***:***@db.prod.local/agentdb",
+  },
+  {
+    key: "api-token",
+    value: "sk-dev-9f3e2a8c4b1d7e0f6a5c3b2d1e0f9a8b",
+    redactedView: "sk-dev-************************",
   },
 ];
 
@@ -82,11 +92,45 @@ export class MockResourceService {
 
   async initialize(): Promise<void> {
     await this.store.mutate((db) => {
+      for (const resource of db.mockResources) {
+        if (!resource.value.startsWith("v1:")) {
+          resource.value = encrypt(resource.value, this.config.secretsKey);
+        }
+      }
       if (db.mockResources.length === 0) {
-        db.mockResources.push(...SEED_RESOURCES.map((resource) => ({ ...resource })));
+        db.mockResources.push(
+          ...SEED_RESOURCES.map((resource) => ({
+            ...resource,
+            value: encrypt(resource.value, this.config.secretsKey),
+          })),
+        );
       }
       if (db.deployStates.length === 0) {
         db.deployStates.push(...SEED_DEPLOYS.map((state) => ({ ...state })));
+      }
+      if (db.users.length === 0) {
+        const timestamp = now();
+        // Seed each user with a baseline inherent scope so the admin panel
+        // shows a non-empty permission->user matrix out of the box. Admins
+        // bypass the capability check regardless of their scopes field.
+        db.users.push(
+          { id: randomUUID(), userId: "admin", role: "admin", scopes: [], createdAt: timestamp },
+          { id: randomUUID(), userId: "default", role: "user", scopes: [], createdAt: timestamp },
+          {
+            id: randomUUID(),
+            userId: "alice",
+            role: "user",
+            scopes: ["read:secrets:dev-db-url", "act:deploy:dev"],
+            createdAt: timestamp,
+          },
+          {
+            id: randomUUID(),
+            userId: "bob",
+            role: "user",
+            scopes: ["read:secrets:prod-db-url"],
+            createdAt: timestamp,
+          },
+        );
       }
     });
   }
@@ -100,12 +144,27 @@ export class MockResourceService {
     const token = randomBytes(32).toString("base64url");
     const issuedAt = now();
     const expiresAt = new Date(Date.now() + TOKEN_TTL_MS).toISOString();
+    const user = this.store.snapshot().users.find((u) => u.userId === ownerId);
+    const role = user?.role ?? "user";
+    // A user can only delegate scopes they themselves hold (admin bypasses).
+    // This is the seam that makes an admin's user-permission grant actually
+    // gate agent access: if the owner lacks `read:secrets:flag`, their agent's
+    // credential is minted WITHOUT it, so the relay 403s it.
+    const userScopes = user?.scopes ?? [];
+    const effectiveScopes =
+      role === "admin"
+        ? scopes
+        : scopes.filter(
+            (scope) =>
+              userScopes.some((granted) => scope === granted || scope.startsWith(granted + "/")),
+          );
     const credential: AgentCredential = {
       tokenHash: hashToken(token),
       agentId,
       runId,
       ownerId,
-      scopes,
+      role,
+      scopes: effectiveScopes,
       issuedAt,
       expiresAt,
       revokedAt: null,
@@ -141,6 +200,113 @@ export class MockResourceService {
   }
 
   /**
+   * Vault — owner-managed key:value secrets. The value is encrypted at rest
+   * (AES-256-GCM) and is never returned by any of these methods; only the
+   * redacted view is exposed. The relay's `handleUpstream` is the only path
+   * that decrypts (for the Tier-2 upstream gate).
+   */
+  async addSecret(
+    key: string,
+    value: string,
+    redactedView: string | undefined,
+  ): Promise<Secret> {
+    const view = redactedView?.trim() || "•••••••• (redacted)";
+    const encrypted = encrypt(value, this.config.secretsKey);
+    await this.store.mutate((db) => {
+      const existing = db.mockResources.find((resource) => resource.key === key);
+      if (existing) {
+        existing.value = encrypted;
+        existing.redactedView = view;
+      } else {
+        db.mockResources.push({ key, value: encrypted, redactedView: view });
+      }
+    });
+    return { key, redactedView: view };
+  }
+
+  /** List all centralized secrets — redacted views only, never the values. */
+  listSecrets(): Secret[] {
+    return this.store.snapshot().mockResources.map((resource) => ({
+      key: resource.key,
+      redactedView: resource.redactedView,
+    }));
+  }
+
+  /** Just the secret keys — for the IntentPlanner's per-key taxonomy. */
+  listSecretKeys(): string[] {
+    return this.store.snapshot().mockResources.map((resource) => resource.key);
+  }
+
+  async deleteSecret(key: string): Promise<boolean> {
+    let removed = false;
+    await this.store.mutate((db) => {
+      const before = db.mockResources.length;
+      db.mockResources = db.mockResources.filter((resource) => resource.key !== key);
+      removed = db.mockResources.length < before;
+    });
+    return removed;
+  }
+
+  /** Resolve a mock-user userId to a User from the central users store. */
+  resolveUser(userId: string): User | null {
+    return this.store.snapshot().users.find((u) => u.userId === userId) ?? null;
+  }
+
+  listUsers(): User[] {
+    return [...this.store.snapshot().users].sort((a, b) =>
+      a.userId.localeCompare(b.userId),
+    );
+  }
+
+  async addUser(
+    userId: string,
+    role: "admin" | "user",
+    scopes: readonly string[] = [],
+  ): Promise<User> {
+    const user: User = {
+      id: randomUUID(),
+      userId,
+      role,
+      scopes: [...new Set(scopes)],
+      createdAt: now(),
+    };
+    await this.store.mutate((db) => {
+      db.users.push(user);
+    });
+    return user;
+  }
+
+  /** Grant an inherent scope to a user (admin-managed). Returns the updated
+   *  user, or null if the user does not exist. Idempotent. */
+  async grantUserScope(userId: string, scope: string): Promise<User | null> {
+    return this.store.mutate((db) => {
+      const user = db.users.find((entry) => entry.userId === userId);
+      if (!user) return null;
+      if (!user.scopes.includes(scope)) user.scopes.push(scope);
+      return structuredClone(user);
+    });
+  }
+
+  /** Revoke an inherent scope from a user (admin-managed). Returns the updated
+   *  user, or null if the user does not exist. Idempotent. */
+  async revokeUserScope(userId: string, scope: string): Promise<User | null> {
+    return this.store.mutate((db) => {
+      const user = db.users.find((entry) => entry.userId === userId);
+      if (!user) return null;
+      user.scopes = user.scopes.filter((entry) => entry !== scope);
+      return structuredClone(user);
+    });
+  }
+
+  /** All secrets across all owners (admin view) — redacted views only. */
+  listAllSecrets(): Secret[] {
+    return this.store.snapshot().mockResources.map((resource) => ({
+      key: resource.key,
+      redactedView: resource.redactedView,
+    }));
+  }
+
+  /**
    * Derive the authorization scope required for a (method, path) pair. The HTTP
    * method is a dimension of the scope: reads need `read:`, mutating data needs
    * `write:`, and action endpoints (deploy) need `act:`.
@@ -148,37 +314,48 @@ export class MockResourceService {
   deriveScope(method: string, path: string): DerivedScope | null {
     const parts = path.split("/").filter(Boolean);
     const kind = parts[0];
-    const owner = parts[1];
-    if (!kind || !owner) return null;
+    if (!kind) return null;
     if (kind === "secrets") {
+      // Centralized: the entire path after `secrets/` is the key (may itself
+      // contain `/` for legacy composite keys like `alice/db-url`).
+      const key = parts.slice(1).join("/");
+      if (!key) return null;
       const verb: DerivedScope["verb"] =
         method === "GET" || method === "HEAD" ? "read" : "write";
-      const key = parts.slice(2).join("/");
       return {
         kind,
-        owner,
+        owner: key,
         verb,
-        scope: `${verb}:secrets:${owner}`,
-        resource: key ? `secrets:${owner}/${key}` : `secrets:${owner}`,
+        scope: `${verb}:secrets:${key}`,
+        resource: `secrets:${key}`,
       };
     }
     if (kind === "deploy") {
+      const env = parts.slice(1).join("/");
+      if (!env) return null;
       return {
         kind,
-        owner,
+        owner: env,
         verb: "act",
-        scope: `act:deploy:${owner}`,
-        resource: `deploy:${owner}`,
+        scope: `act:deploy:${env}`,
+        resource: `deploy:${env}`,
       };
     }
     return null;
   }
 
   /**
-   * Boundary 3 — the policy-enforcing relay. Validates the Tier 1 token (injected
-   * by the egress proxy), derives the required scope, checks the agent's scopes,
-   * reaches the protected data, and returns a redacted envelope. Every path
-   * writes an Audit row; on a deny the upstream is never contacted.
+   * Boundary 3 — the policy-enforcing relay.
+   *
+   * Flow:
+   * 1. Validate Tier 1 credential (injected by the egress proxy)
+   * 2. Derive resource scope for response handling
+   * 3. Normalize credential into AuthorizationContext
+   * 4. Derive requested capability
+   * 5. Authorize capability
+   * 6. Only then reach the protected resource
+   * 7. Redact response
+   * 8. Audit the decision
    */
   async relay(
     method: string,
@@ -186,32 +363,85 @@ export class MockResourceService {
     body: unknown,
     token: string | undefined,
   ): Promise<RelayResult> {
+
+    // 1. Validate Tier 1 credential
     if (!token) {
       await this.auditDeny(method, path, null, "missing token", null);
       return { status: 401, body: { error: "missing token" } };
     }
+
+    // 2. Authentication / Credential validation
     const credential = this.validateToken(token);
+
     if (!credential) {
       await this.auditDeny(method, path, null, "invalid or revoked token", null);
       return { status: 401, body: { error: "invalid or revoked token" } };
     }
+
+    // Handle Reources and redaction
     const scope = this.deriveScope(method, path);
     if (!scope) {
       await this.auditDeny(method, path, credential, "unknown resource", null);
       return { status: 404, body: { error: "unknown resource" } };
     }
-    if (!credential.scopes.includes(scope.scope)) {
-      await this.auditDeny(method, path, credential, "scope mismatch", scope.scope);
-      return { status: 403, body: { error: "scope mismatch", scope: scope.scope } };
+    // 3. Normalize credential into AuthorizationContext
+    const context = this.credentialToContext(credential);
+
+    // 4. Derive requested capability
+    const requestedCapability = this.scopeToRequestedCapability(scope);
+
+    if (!requestedCapability){
+      await this.auditDeny(
+        method,
+        path,
+        credential,
+        "unknown capability",
+        null,
+      )
+
+      return {
+        status: 404,
+        body: { error: "unknown resource" },
+      }
     }
 
+    // 5. Authorize capability
+    const decision = this.authorize(context, requestedCapability);
+
+    if (!decision.allowed){
+      await this.auditDeny(
+        method,
+        path,
+        credential,
+        "capability not granted",
+        scope.scope,
+      )
+
+      return {
+        status: 403,
+        body: {
+          error: "capability not granted",
+          capability: requestedCapability.scope,
+        }
+      }
+    }
+
+    // 6. Protected resource
     const upstream = await this.handleUpstream(method, path, body);
     const redacted = this.redactEnvelope(scope, upstream);
 
-    await this.writeAudit({
+    // Phase 2: Calculate risk scores before audit
+    const db = this.store.snapshot();
+    const agent = db.agents.find((a) => a.id === credential.agentId);
+    const recentAudit = db.audit.filter((a) => a.agentId === credential.agentId).slice(-20); // Last 20 operations
+    
+    const auditEntry: Omit<Audit, "id" | "timestamp"> = {
       humanPrincipalId: "user:" + credential.ownerId,
       agentId: credential.agentId,
       agentPrincipalId: "agent:" + credential.agentId,
+      planId: null,
+      planHash: null,
+      capability: scope.scope,
       runId: credential.runId,
       method,
       action: scope.verb,
@@ -219,7 +449,34 @@ export class MockResourceService {
       scope: scope.scope,
       decision: "allow",
       reason: "scope match",
-    });
+    };
+
+    if (agent) {
+      const effectiveAgent = { ...agent, scopes: credential.scopes };
+      // Calculate agent risk profile
+      const agentProfile = calculateAgentRiskProfile(effectiveAgent, recentAudit);
+      
+      // Assess operation risk
+      const operationAssessment = assessOperationRisk(
+        effectiveAgent,
+        agentProfile,
+        scope.resource,
+        scope.scope,
+        recentAudit,
+      );
+
+      if (operationAssessment.operationRiskLevel !== undefined) {
+        auditEntry.operationRiskLevel = operationAssessment.operationRiskLevel;
+      }
+      if (operationAssessment.operationRiskScore !== undefined) {
+        auditEntry.operationRiskScore = operationAssessment.operationRiskScore;
+      }
+      if (operationAssessment.operationRiskFactors) {
+        auditEntry.operationRiskFactors = operationAssessment.operationRiskFactors;
+      }
+    }
+
+    await this.writeAudit(auditEntry);
 
     return { status: upstream.status, body: redacted };
   }
@@ -238,29 +495,37 @@ export class MockResourceService {
   ): Promise<UpstreamResult> {
     const parts = path.split("/").filter(Boolean);
     const kind = parts[0];
-    const target = parts[1];
+    const target = parts.slice(1).join("/");
     if (!kind || !target) {
       return { status: 404, body: { error: "unknown resource" } };
     }
 
     if (kind === "secrets") {
-      const key = parts.slice(2).join("/");
-      if (!key) return { status: 400, body: { error: "missing key" } };
+      const key = target;
       if (method === "GET" || method === "HEAD") {
         const resource = this.store
           .snapshot()
-          .mockResources.find((entry) => entry.owner === target && entry.key === key);
+          .mockResources.find((entry) => entry.key === key);
         if (!resource) return { status: 404, body: { error: "not found" } };
-        return { status: 200, body: structuredClone(resource) };
+        return {
+          status: 200,
+          body: {
+            ...structuredClone(resource),
+            value: decrypt(resource.value, this.config.secretsKey),
+          },
+        };
       }
       if (method === "PUT") {
         let updated = false;
         await this.store.mutate((db) => {
           const entry = db.mockResources.find(
-            (resource) => resource.owner === target && resource.key === key,
+            (resource) => resource.key === key,
           );
           if (entry) {
-            entry.value = typeof body === "string" ? body : JSON.stringify(body);
+            entry.value = encrypt(
+              typeof body === "string" ? body : JSON.stringify(body),
+              this.config.secretsKey,
+            );
             entry.redactedView = "*** redacted ***";
             updated = true;
           }
@@ -295,7 +560,7 @@ export class MockResourceService {
     if (upstream.status >= 400) return upstream.body;
     if (scope.kind === "secrets" && scope.verb === "read" && upstream.status === 200) {
       const resource = upstream.body as MockResource;
-      return { owner: resource.owner, key: resource.key, value: resource.redactedView };
+      return { key: resource.key, value: resource.redactedView };
     }
     return upstream.body;
   }
@@ -307,7 +572,15 @@ export class MockResourceService {
   }
 
   async writeAudit(entry: Omit<Audit, "id" | "timestamp">): Promise<Audit> {
-    const audit: Audit = { ...entry, id: randomUUID(), timestamp: now() };
+    const agent = entry.agentId
+      ? this.store.snapshot().agents.find((item) => item.id === entry.agentId)
+      : undefined;
+    const audit: Audit = {
+      ...entry,
+      agentName: entry.agentName ?? agent?.name ?? null,
+      id: randomUUID(),
+      timestamp: now(),
+    };
     await this.store.mutate((db) => {
       db.audit.push(audit);
     });
@@ -322,10 +595,32 @@ export class MockResourceService {
     scope: string | null,
   ): Promise<void> {
     const derived = this.deriveScope(method, path);
+    const database = this.store.snapshot();
+    const agent = credential
+      ? database.agents.find((item) => item.id === credential.agentId)
+      : undefined;
+    const recentAudit = credential
+      ? database.audit.filter((entry) => entry.agentId === credential.agentId).slice(-20)
+      : [];
+    const assessment = agent && derived
+      ? (() => {
+          const effectiveAgent = { ...agent, scopes: credential?.scopes ?? [] };
+          return assessOperationRisk(
+          effectiveAgent,
+          calculateAgentRiskProfile(effectiveAgent, recentAudit),
+          derived.resource,
+          derived.scope,
+          recentAudit,
+          );
+        })()
+      : null;
     await this.writeAudit({
       humanPrincipalId: credential ? "user:" + credential.ownerId : "unknown",
       agentId: credential?.agentId ?? null,
       agentPrincipalId: credential ? "agent:" + credential.agentId : null,
+      planId: null,
+      planHash: null,
+      capability: derived?.scope ?? null,
       runId: credential?.runId ?? null,
       method,
       action: derived?.verb ?? "unknown",
@@ -333,7 +628,142 @@ export class MockResourceService {
       scope: scope ?? derived?.scope ?? null,
       decision: "deny",
       reason,
+      ...(assessment
+        ? {
+            operationRiskLevel: assessment.operationRiskLevel,
+            operationRiskScore: assessment.operationRiskScore,
+            operationRiskFactors: assessment.operationRiskFactors,
+          }
+        : {}),
     });
+  }
+
+  /* Normalizes the current AgentCredential representation into the
+  representation consumed by the enforcement point
+
+  The enforcement logic should NOT depend directly on AgentCredential.scopes
+  This adapter is the seam that allows plan-bound capabilities to be introduced
+  later
+  */
+  credentialToContext(
+    credential: AgentCredential
+  ): AuthorizationContext {
+    return {
+      agentId: credential.agentId,
+      runId: credential.runId,
+      ownerId: credential.ownerId,
+      isAdmin: credential.role === "admin",
+      capabilities: credential.scopes?.map(
+        (scope) => this.scopeToCapability(scope)) ?? [],
+      expiresAt: credential.expiresAt,
+    };
+  }
+
+  /* Convert string-based scope into the normalized
+  capability representation.
+  */
+  private scopeToCapability(scope: string): Capability {
+    const parts = scope.split(":");
+
+    if (parts.length !== 3) {
+      throw new Error(`Invalid capability scope: ${scope}`);
+    }
+
+    const [action, resource, target] = parts;
+
+    if (
+      action !== "read" &&
+      action !== "write" &&
+      action !== "act"
+    ) {
+      throw new Error(`Invalid capability action: ${action}`);
+    }
+
+    if (!resource){
+      throw new Error(`Invalid capability resource: ${resource}`);
+    }
+
+    if (!target){
+      throw new Error(`Invalid capability scope: ${target}`);
+    }
+
+      return {
+        action,
+        resource,
+        scope: target,
+      };
+  }
+
+  private scopeToRequestedCapability(
+    scope: DerivedScope,
+  ): RequestedCapability {
+    const [action, resource, target] = scope.scope.split(":");
+
+    if (
+      action !== "read" &&
+      action !== "write" &&
+      action !== "act"
+    ) {
+      throw new Error(`Invalid derived scope: ${scope.scope}`);
+    }
+
+    if(!resource || !target) {
+      throw new Error(`Invalid derived scope: ${scope.scope}`);
+    }
+
+    return {
+      action,
+      resource,
+      scope: target,
+    }
+  }
+
+  /* Enforcement decision
+
+  This function intentionally knows nothing about AgentCredential,
+  tokens, JWTs, plan compilers, or how capabilities were created
+
+  It only answers: "Does this authorization context contain the
+  capability required by this request?"
+   */
+  authorize(
+    context: AuthorizationContext,
+    requested: RequestedCapability,
+  ): AuthorizationDecision {
+    if (context.isAdmin) {
+      return {
+        allowed: true,
+        reason: "capability_granted",
+        requiredCapability: requested,
+        matchedCapability: {
+          action: requested.action,
+          resource: requested.resource,
+          scope: requested.scope,
+        },
+      };
+    }
+    const matchedCapability = context.capabilities.find(
+      (capability) =>
+        capability.action === requested.action &&
+        capability.resource === requested.resource &&
+        (capability.scope === requested.scope ||
+          requested.scope.startsWith(capability.scope + "/")),
+    );
+
+    if (!matchedCapability){
+      return {
+        allowed: false,
+        reason: "capability_not_granted",
+        requiredCapability: requested,
+      };
+    }
+
+    return {
+      allowed: true,
+      reason: "capability_granted",
+      requiredCapability: requested,
+      matchedCapability,
+    };
   }
 
   listAudit(agentId?: string): Audit[] {
@@ -341,4 +771,5 @@ export class MockResourceService {
     const filtered = agentId ? all.filter((entry) => entry.agentId === agentId) : all;
     return [...filtered].sort((left, right) => right.timestamp.localeCompare(left.timestamp));
   }
+
 }

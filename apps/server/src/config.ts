@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 
 const envSchema = z.object({
@@ -70,6 +71,11 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     typeof process.getuid === "function" && typeof process.getgid === "function"
       ? process.getuid() + ":" + process.getgid()
       : "1000:1000";
+  // Derive the vault encryption key from the upstream secret so no new secret
+  // needs managing. A dev fallback keeps tests working without it.
+  const secretsKey = createHash("sha256")
+    .update(realUpstreamSecret || "dev-vault-key-not-for-production")
+    .digest();
   return {
     host: env.HOST,
     port: env.PORT,
@@ -93,6 +99,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     mockResourceHost: env.MOCK_RESOURCE_HOST,
     mockResourcePort: env.MOCK_RESOURCE_PORT,
     realUpstreamSecret,
+    secretsKey,
     arkApiKey: env.ARK_API_KEY?.trim() ?? "",
     arkModel: env.ARK_MODEL?.trim() ?? "",
     arkBaseUrl: env.ARK_BASE_URL.replace(/\/+$/, ""),
